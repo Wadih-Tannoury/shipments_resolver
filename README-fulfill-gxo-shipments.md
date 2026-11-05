@@ -3,13 +3,17 @@
 Manually triggered GitHub Actions workflow that fulfills Kibo shipments which GXO has
 already shipped and for which an invoice document exists.
 
-## Files
+## Repository layout
 
 ```
+README.md
+fulfill_gxo_shipments.py
+requirements.txt
 .github/workflows/fulfill-gxo-shipments.yml
-scripts/fulfill_gxo_shipments.py
-scripts/requirements.txt
 ```
+
+Everything sits at the repository root. The workflow file has to live under
+`.github/workflows/` — GitHub only picks up workflows from that path.
 
 ## Repository secrets
 
@@ -58,6 +62,16 @@ Actions → **Fulfill GXO shipments in Kibo** → Run workflow.
 | `kibo_host` | `tp3.mozu.com` | Kibo host suffix |
 
 Start with `dry_run` left on, review the artifact, then re-run with it off.
+
+## Running it locally
+
+```bash
+pip install -r requirements.txt
+export BI_BIGQUERY_CREDS="$(cat bi-service-account.json)"
+export TIL_BIGQUERY_CREDS="$(cat til-service-account.json)"
+export KIBO_API_CREDS="$(cat kibo_credentials.json)"
+python fulfill_gxo_shipments.py --dry-run
+```
 
 ## Output
 
