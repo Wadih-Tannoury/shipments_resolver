@@ -11,6 +11,10 @@ on:
         description: "Warehouse on the SHIPPED event"
         type: string
         default: "GXO"
+      oms_status:
+        description: "shipmentStatus to keep in oms_active_shipments (empty = no filter)"
+        type: string
+        default: "READY"
       shipment_order_numbers:
         description: "Optional: comma separated shipmentOrderNumbers to restrict the run"
         type: string
@@ -57,6 +61,7 @@ jobs:
           TIL_BIGQUERY_CREDS: ${{ secrets.TIL_BIGQUERY_CREDS }}
           KIBO_API_CREDS: ${{ secrets.KIBO_API_CREDS }}
           INPUT_WAREHOUSE: ${{ inputs.warehouse }}
+          INPUT_OMS_STATUS: ${{ inputs.oms_status }}
           INPUT_HOST: ${{ inputs.kibo_host }}
           INPUT_LIMIT: ${{ inputs.limit }}
           INPUT_NUMBERS: ${{ inputs.shipment_order_numbers }}
@@ -67,6 +72,7 @@ jobs:
           python fulfill_gxo_shipments.py \
             $DRY_RUN_FLAG \
             --warehouse "$INPUT_WAREHOUSE" \
+            --oms-status "$INPUT_OMS_STATUS" \
             --host "$INPUT_HOST" \
             --limit "$INPUT_LIMIT" \
             --shipment-order-numbers "$INPUT_NUMBERS" \
