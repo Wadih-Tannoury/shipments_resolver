@@ -30,7 +30,9 @@ service account needs BigQuery Job User on its own project and Data Viewer on th
 ## What the run does
 
 1. Reads `shipment_order_number`, `tenant_id`, `site_id` from
-   `tlg-business-intelligence-prd.til.oms_active_shipments`.
+   `tlg-business-intelligence-prd.til.oms_active_shipments`, keeping only the rows whose
+   `shipmentStatus` is `READY`. Anything already fulfilled, cancelled or otherwise not
+   pending never reaches Kibo.
 2. Checks `tlg-wlfs-prd.til.prd_shipmentStatus` for a `SHIPPED` event with
    `warehouse = 'GXO'`.
 3. Checks `tlg-wlfs-prd.til.prd_invoiceUpdate` for an `INVOICE_RESULT` whose
@@ -49,7 +51,9 @@ service account needs BigQuery Job User on its own project and Data Viewer on th
    - `GET  https://t{tenantId}-s{siteId}.tp3.mozu.com/api/commerce/shipments/{shipmentNumber}`
    - `PUT  https://t{tenantId}-s{siteId}.tp3.mozu.com/api/commerce/shipments/{shipmentNumber}/fulfilled`
 
-   Shipments already in a terminal status (FULFILLED, CANCELED, CLOSED…) are left alone.
+   The `GET` is a last safety net: a shipment that Kibo already reports in a terminal
+   status (FULFILLED, CANCELED, CLOSED…) is reported as `already_terminal` and left alone,
+   which should be rare now that the status filter happens in BigQuery.
 
 Kibo tokens are obtained from `https://home.mozu.com/api/platform/applications/authtickets/oauth`
 and cached per `tenantId`, with a refresh on 401 and backoff on 429/5xx.
@@ -62,6 +66,7 @@ Actions → **Fulfill GXO shipments in Kibo** → Run workflow.
 | --- | --- | --- |
 | `dry_run` | `true` | Runs every check and reads each shipment, but never calls `/fulfilled` |
 | `warehouse` | `GXO` | Warehouse filter on the SHIPPED event |
+| `oms_status` | `READY` | `shipmentStatus` kept from `oms_active_shipments`; leave empty to disable the filter |
 | `shipment_order_numbers` | empty | Comma separated list to restrict the run to specific shipments |
 | `limit` | `0` | Cap on the number of active shipments (0 = no limit) |
 | `kibo_host` | `tp3.mozu.com` | Kibo host suffix |
@@ -82,7 +87,7 @@ python fulfill_gxo_shipments.py --dry-run
 
 Every run uploads `fulfill-gxo-shipments-results` containing a CSV with one row per
 active shipment: the two BigQuery checks, the document link, the logistic order number,
-the derived Kibo shipment number, the status before and after, the action taken, and any
+the OMS status, the derived Kibo shipment number, the Kibo status before and after, the action taken, and any
 error. A condensed table is also written to the job summary. The job exits with code 2 if
 any eligible shipment failed, so a failed run is visible in the Actions list.
 
