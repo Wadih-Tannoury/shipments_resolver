@@ -6,7 +6,7 @@ on:
       dry_run:
         description: "Dry run: run all checks and read each shipment, but do not call /fulfilled"
         type: boolean
-        default: true
+        default: false
       warehouse:
         description: "Warehouse on the SHIPPED event"
         type: string
