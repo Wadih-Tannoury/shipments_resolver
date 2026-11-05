@@ -40,6 +40,11 @@ service account needs BigQuery Job User on its own project and Data Viewer on th
    SHIPPED payload (`BB82902`), drops the first two characters and uses the rest as the
    Kibo `shipmentNumber` (`82902`). A value that is not numeric after the prefix is
    removed is reported as an error rather than sent to Kibo.
+
+   A shipment order number can be shipped in several parcels and therefore have several
+   SHIPPED events, each with its own `logisticOrderNumber` and its own Kibo shipment.
+   Every distinct one is fulfilled, and the CSV gets one row per Kibo shipment. The
+   reverse does not happen: a Kibo shipment belongs to exactly one shipment order number.
 5. Calls, per shipment:
    - `GET  https://t{tenantId}-s{siteId}.tp3.mozu.com/api/commerce/shipments/{shipmentNumber}`
    - `PUT  https://t{tenantId}-s{siteId}.tp3.mozu.com/api/commerce/shipments/{shipmentNumber}/fulfilled`
