@@ -80,6 +80,7 @@ SHIPMENT_NUMBER_CANDIDATES = ("shipmentOrderNumber", "shipment_order_number")
 PAYLOAD_CANDIDATES = ("requestPayload", "request_payload")
 EVENT_TYPE_CANDIDATES = ("eventType", "event_type")
 WAREHOUSE_CANDIDATES = ("warehouse", "warehouseCode", "warehouse_code")
+OMS_STATUS_CANDIDATES = ("shipmentStatus", "shipment_status", "status")
 TIMESTAMP_CANDIDATES = (
     "eventTimestamp", "event_timestamp", "insertTimestamp", "insert_timestamp",
     "ingestionTimestamp", "ingestion_timestamp", "createdAt", "created_at",
@@ -274,6 +275,7 @@ class Candidate:
     shipment_order_number: str
     tenant_id: str
     site_id: str
+    oms_shipment_status: str = ""
     has_shipped_gxo: bool = False
     has_invoice_document: bool = False
     document_link: str = ""
@@ -296,24 +298,31 @@ def fetch_active_shipments(
     client: bigquery.Client,
     only_numbers: Sequence[str],
     limit: int,
+    oms_status: str,
 ) -> List[Candidate]:
     columns = table_columns(client, BI_PROJECT, BI_DATASET, BI_TABLE)
     where = f"`{BI_PROJECT}.{BI_DATASET}.{BI_TABLE}`"
     number_col = resolve_column(columns, SHIPMENT_NUMBER_CANDIDATES, where)
     tenant_col = resolve_column(columns, ("tenant_id", "tenantId"), where)
     site_col = resolve_column(columns, ("site_id", "siteId"), where)
+    status_col = resolve_column(columns, OMS_STATUS_CANDIDATES, where, required=bool(oms_status))
 
     filters = [f"`{number_col}` IS NOT NULL", f"TRIM(CAST(`{number_col}` AS STRING)) != ''"]
     params: List[bigquery.ScalarQueryParameter | bigquery.ArrayQueryParameter] = []
+    if oms_status:
+        filters.append(f"UPPER(TRIM(CAST(`{status_col}` AS STRING))) = UPPER(@oms_status)")
+        params.append(bigquery.ScalarQueryParameter("oms_status", "STRING", oms_status))
     if only_numbers:
         filters.append(f"CAST(`{number_col}` AS STRING) IN UNNEST(@only_numbers)")
         params.append(bigquery.ArrayQueryParameter("only_numbers", "STRING", list(only_numbers)))
 
+    status_select = f"CAST(`{status_col}` AS STRING)" if status_col else "CAST(NULL AS STRING)"
     sql = f"""
         SELECT DISTINCT
             CAST(`{number_col}` AS STRING) AS shipment_order_number,
             CAST(`{tenant_col}` AS STRING) AS tenant_id,
-            CAST(`{site_col}`   AS STRING) AS site_id
+            CAST(`{site_col}`   AS STRING) AS site_id,
+            {status_select} AS oms_shipment_status
         FROM `{BI_PROJECT}.{BI_DATASET}.{BI_TABLE}`
         WHERE {' AND '.join(filters)}
         ORDER BY shipment_order_number
@@ -337,7 +346,12 @@ def fetch_active_shipments(
         if key in seen:
             continue
         seen.add(key)
-        candidates.append(Candidate(shipment_order_number=number, tenant_id=tenant, site_id=site))
+        candidates.append(Candidate(
+            shipment_order_number=number,
+            tenant_id=tenant,
+            site_id=site,
+            oms_shipment_status=clean(row["oms_shipment_status"]),
+        ))
     return candidates
 
 
@@ -607,7 +621,7 @@ def shipment_status(shipment: Dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 CSV_FIELDS = [
-    "shipment_order_number", "tenant_id", "site_id",
+    "shipment_order_number", "tenant_id", "site_id", "oms_shipment_status",
     "has_shipped_gxo", "has_invoice_document", "document_link",
     "logistic_order_number", "kibo_shipment_number",
     "kibo_status_before", "kibo_status_after",
@@ -668,6 +682,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true",
                         help="Run every check and read each Kibo shipment, but do not call the fulfilled endpoint.")
     parser.add_argument("--warehouse", default="GXO", help="Warehouse filter on the SHIPPED event.")
+    parser.add_argument("--oms-status", default="READY",
+                        help="Keep only rows with this shipmentStatus in oms_active_shipments. Pass an empty string to disable the filter.")
     parser.add_argument("--host", default=DEFAULT_HOST, help="Kibo host suffix.")
     parser.add_argument("--auth-url", default=DEFAULT_AUTH_URL, help="Kibo OAuth URL.")
     parser.add_argument("--limit", type=int, default=0, help="Limit the number of active shipments (0 = no limit).")
@@ -684,6 +700,7 @@ def parse_args() -> argparse.Namespace:
         parser.error("--batch-size must be at least 1.")
     if args.max_retries < 1:
         parser.error("--max-retries must be at least 1.")
+    args.oms_status = args.oms_status.strip()
     args.host = re.sub(r"^https?://", "", args.host.strip()).split("/", 1)[0].rstrip(".")
     return args
 
@@ -699,6 +716,7 @@ def main() -> int:
 
     log(f"Mode: {'DRY RUN' if args.dry_run else 'LIVE'}")
     log(f"Warehouse filter: {args.warehouse}")
+    log(f"oms_active_shipments status filter: {args.oms_status or '(none)'}")
     log(f"Kibo host: {args.host}")
 
     kibo_credentials = load_json_env("KIBO_API_CREDS")
@@ -714,8 +732,12 @@ def main() -> int:
     if only_numbers:
         log(f"Restricting the run to {len(only_numbers)} shipment order number(s).")
 
-    candidates = fetch_active_shipments(bi_client, only_numbers, args.limit)
-    log(f"Active shipments read from {BI_TABLE}: {len(candidates)}")
+    candidates = fetch_active_shipments(bi_client, only_numbers, args.limit, args.oms_status)
+    log(
+        f"Active shipments read from {BI_TABLE}"
+        + (f" with shipmentStatus = {args.oms_status}" if args.oms_status else "")
+        + f": {len(candidates)}"
+    )
     if not candidates:
         log("Nothing to do.")
         write_csv(output_path, candidates)
