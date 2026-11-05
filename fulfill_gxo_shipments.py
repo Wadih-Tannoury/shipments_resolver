@@ -40,7 +40,7 @@ import re
 import sys
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -343,8 +343,15 @@ def fetch_active_shipments(
 
 def fetch_shipped_events(
     client: bigquery.Client, numbers: Sequence[str], warehouse: str, batch_size: int
-) -> Dict[str, Dict[str, Any]]:
-    """Return {shipmentOrderNumber: latest SHIPPED payload} for the given warehouse."""
+) -> Dict[str, List[str]]:
+    """
+    Return {shipmentOrderNumber: [logisticOrderNumber, ...]} for the given warehouse.
+
+    A shipment order number can be shipped in several parcels, so it can have several
+    SHIPPED events, each one carrying its own logisticOrderNumber and therefore its own
+    Kibo shipment. Every distinct value is kept, newest event first. A key with an empty
+    list means a SHIPPED event exists but carries no logisticOrderNumber.
+    """
     where = f"`{WLFS_PROJECT}.{WLFS_DATASET}.{SHIPMENT_STATUS_TABLE}`"
     columns = table_columns(client, WLFS_PROJECT, WLFS_DATASET, SHIPMENT_STATUS_TABLE)
     number_col = resolve_column(columns, SHIPMENT_NUMBER_CANDIDATES, where)
@@ -365,7 +372,7 @@ def fetch_shipped_events(
         {order_by}
     """
 
-    found: Dict[str, Dict[str, Any]] = {}
+    found: Dict[str, List[str]] = {}
     for batch in chunked(numbers, batch_size):
         job = client.query(
             sql,
@@ -376,13 +383,15 @@ def fetch_shipped_events(
         )
         for row in job.result():
             number = clean(row["shipment_order_number"])
-            if number in found:  # rows are newest first
+            if not number:
                 continue
+            logistic_numbers = found.setdefault(number, [])
             payload = parse_payload(row["payload"])
-            if payload is not None:
-                found[number] = payload
-            else:
-                found.setdefault(number, {})
+            if payload is None:
+                continue
+            logistic = logistic_order_number_of(payload)
+            if logistic and logistic not in logistic_numbers:
+                logistic_numbers.append(logistic)
     return found
 
 
@@ -627,8 +636,8 @@ def write_job_summary(candidates: List[Candidate], dry_run: bool) -> None:
         "## Fulfil GXO shipments",
         "",
         f"- Mode: **{'dry run' if dry_run else 'live'}**",
-        f"- Active shipments read: **{len(candidates)}**",
-        f"- Eligible (SHIPPED@GXO + invoice document): **{len(eligible)}**",
+        f"- Rows (one per shipment): **{len(candidates)}**",
+        f"- Eligible (SHIPPED + invoice document): **{len(eligible)}**",
         f"- Fulfilled: **{len(fulfilled)}**",
         f"- Already in a terminal status: **{len(already)}**",
         f"- With an error: **{len(failed)}**",
@@ -715,17 +724,21 @@ def main() -> int:
 
     numbers = [c.shipment_order_number for c in candidates]
     shipped = fetch_shipped_events(wlfs_client, numbers, args.warehouse, args.batch_size)
-    log(f"SHIPPED events at {args.warehouse}: {len(shipped)}")
+    log(
+        f"Shipment order numbers with a SHIPPED event at {args.warehouse}: {len(shipped)} "
+        f"({sum(len(v) for v in shipped.values())} distinct logisticOrderNumber values)"
+    )
     invoiced = fetch_invoice_documents(wlfs_client, numbers, args.batch_size)
     log(f"INVOICE_RESULT events with an http documentLink: {len(invoiced)}")
 
     kibo = KiboClient({"client_id": client_id, "client_secret": client_secret},
                       args.auth_url, args.host, args.timeout)
 
+    rows: List[Candidate] = []
     eligible: List[Candidate] = []
     for candidate in candidates:
-        payload = shipped.get(candidate.shipment_order_number)
-        candidate.has_shipped_gxo = payload is not None
+        logistic_numbers = shipped.get(candidate.shipment_order_number)
+        candidate.has_shipped_gxo = logistic_numbers is not None
         candidate.document_link = invoiced.get(candidate.shipment_order_number, "")
         candidate.has_invoice_document = bool(candidate.document_link)
 
@@ -737,23 +750,39 @@ def main() -> int:
                 missing.append("INVOICE_RESULT document")
             candidate.action = "skipped"
             candidate.error = "Missing " + " and ".join(missing)
+            rows.append(candidate)
             continue
 
-        candidate.logistic_order_number = logistic_order_number_of(payload or {})
-        if not candidate.logistic_order_number:
+        if not logistic_numbers:
             candidate.action = "skipped"
             candidate.error = "No logisticOrderNumber in the SHIPPED requestPayload."
+            rows.append(candidate)
             continue
 
-        number, error = kibo_shipment_number(candidate.logistic_order_number)
-        if error:
-            candidate.action = "skipped"
-            candidate.error = error
-            continue
-        candidate.kibo_shipment_number = number
-        eligible.append(candidate)
+        # One shipment order number can carry several SHIPPED events, each with its own
+        # logisticOrderNumber and therefore its own Kibo shipment. Fulfill all of them.
+        if len(logistic_numbers) > 1:
+            log(
+                f"{candidate.shipment_order_number}: {len(logistic_numbers)} SHIPPED events "
+                f"({', '.join(logistic_numbers)})"
+            )
+        seen_shipment_numbers: set[str] = set()
+        for logistic in logistic_numbers:
+            row = replace(candidate)
+            row.logistic_order_number = logistic
+            number, error = kibo_shipment_number(logistic)
+            if error:
+                row.action = "skipped"
+                row.error = error
+            elif number in seen_shipment_numbers:
+                continue
+            else:
+                seen_shipment_numbers.add(number)
+                row.kibo_shipment_number = number
+                eligible.append(row)
+            rows.append(row)
 
-    log(f"Eligible for fulfillment: {len(eligible)}")
+    log(f"Eligible shipments to fulfill: {len(eligible)}")
 
     for index, candidate in enumerate(eligible, start=1):
         candidate.correlation_id = uuid.uuid4().hex
@@ -812,13 +841,13 @@ def main() -> int:
         if args.sleep_between_requests > 0:
             time.sleep(args.sleep_between_requests)
 
-    write_csv(output_path, candidates)
-    write_job_summary(candidates, args.dry_run)
+    write_csv(output_path, rows)
+    write_job_summary(rows, args.dry_run)
 
     failures = [c for c in eligible if not c.success]
     log(f"Results written to {output_path}")
     log(
-        f"Summary: {len(candidates)} active, {len(eligible)} eligible, "
+        f"Summary: {len(candidates)} active shipment order numbers, {len(eligible)} eligible shipments, "
         f"{sum(1 for c in eligible if c.action == 'fulfilled' and c.success)} fulfilled, "
         f"{len(failures)} failed."
     )
