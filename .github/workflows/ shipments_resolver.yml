@@ -43,6 +43,10 @@ on:
           - all
           - none
         default: released
+      max_rows_per_transaction:
+        description: "release-held-exchange: retry limit, max shipment.itemscanceled rows per transactionId (0 = no limit)"
+        type: string
+        default: "2"
       include_already_marked:
         description: "release-held-exchange: also process events already flagged toBeReprocessed"
         type: boolean
@@ -96,6 +100,7 @@ jobs:
           INPUT_LIMIT: ${{ inputs.limit || '0' }}
           INPUT_NUMBERS: ${{ inputs.numbers }}
           INPUT_MARK_SCOPE: ${{ inputs.mark_scope || 'released' }}
+          INPUT_MAX_ROWS_PER_TX: ${{ inputs.max_rows_per_transaction || '2' }}
           INPUT_DRY_RUN: ${{ inputs.dry_run }}
           INPUT_INCLUDE_MARKED: ${{ inputs.include_already_marked }}
         run: |
@@ -110,6 +115,7 @@ jobs:
             --limit "$INPUT_LIMIT" \
             --order-numbers "$INPUT_NUMBERS" \
             --mark-scope "$INPUT_MARK_SCOPE" \
+            --max-rows-per-transaction "$INPUT_MAX_ROWS_PER_TX" \
             --output "release_held_exchange_shipments_results.csv"
 
       - name: Upload the results
