@@ -12,7 +12,7 @@ Pipeline
          AND NOT EXISTS (
              SELECT 1 FROM `tlg-wlfs-prd`.til.prd_tilEvents til2
              WHERE til2.eventType = 'shipment.itemscanceled'
-               AND til2.warningMessage IS NULL
+               AND (til2.warningMessage IS NULL OR til2.warningMessage = '')
                AND til2.orderNumber = til1.orderNumber
          )
        ORDER BY eventTimestamp DESC
@@ -77,6 +77,10 @@ DEFAULT_HOST = "tp3.mozu.com"
 DEFAULT_AUTH_URL = "https://home.mozu.com/api/platform/applications/authtickets/oauth"
 
 SHIPMENT_DATA_BODY: Dict[str, Any] = {"holdExchangeProcess": False}
+
+# Retry limit: a transactionId that already appears in more than this many
+# shipment.itemscanceled rows has been retried enough and is left alone.
+DEFAULT_MAX_ROWS_PER_TRANSACTION = 2
 
 BQ_SCOPES = ["https://www.googleapis.com/auth/bigquery"]
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -342,6 +346,7 @@ class Row:
     site_id: str = ""
     shipment_number: str = ""
     event_timestamp: str = ""
+    transaction_row_count: int = 0
     action: str = "skipped"
     success: bool = False
     error: str = ""
@@ -359,6 +364,7 @@ def fetch_held_events(
     only_order_numbers: Sequence[str],
     limit: int,
     include_already_marked: bool,
+    max_rows_per_transaction: int,
 ) -> Tuple[List[Row], Dict[str, str], int]:
     """
     Run the held-with-exchange query.
@@ -366,6 +372,10 @@ def fetch_held_events(
     Returns (rows, the column names the update step needs, number of BigQuery rows read).
     One BigQuery row produces one Row per shipmentNumber found in its requestPayload,
     and one Row carrying the parsing error when nothing usable is in there.
+
+    Each row also carries how many `shipment.itemscanceled` rows share its transactionId,
+    which is the number of attempts made so far. Past max_rows_per_transaction the row is
+    reported as `retry_limit_reached` and neither released nor flagged.
     """
     where = f"`{WLFS_PROJECT}.{WLFS_DATASET}.{TIL_EVENTS_TABLE}`"
     schema = table_schema(client, WLFS_PROJECT, WLFS_DATASET, TIL_EVENTS_TABLE)
@@ -383,7 +393,7 @@ def fetch_held_events(
         f"""NOT EXISTS (
             SELECT 1 FROM {where} til2
             WHERE til2.`{event_col}` = @event_type
-              AND til2.`{warning_col}` IS NULL
+              AND (til2.`{warning_col}` IS NULL OR til2.`{warning_col}` = '')
               AND til2.`{order_col}` = til1.`{order_col}`
         )""",
     ]
@@ -400,12 +410,20 @@ def fetch_held_events(
     transaction_select = f"CAST(til1.`{transaction_col}` AS STRING)"
     ts_select = f"CAST(til1.`{ts_col}` AS STRING)" if ts_col else "CAST(NULL AS STRING)"
     order_by = f"ORDER BY til1.`{ts_col}` DESC" if ts_col else ""
+    # Counted over the whole event type, not over the filtered set: an earlier attempt is
+    # usually already flagged toBeReprocessed and would otherwise be missed. Other event
+    # types sharing the transactionId are excluded so they cannot inflate the count.
     sql = f"""
         SELECT
             {transaction_select} AS transaction_id,
             CAST(til1.`{order_col}` AS STRING) AS order_number,
             CAST(til1.`{payload_col}` AS STRING) AS payload,
-            {ts_select} AS event_timestamp
+            {ts_select} AS event_timestamp,
+            (
+                SELECT COUNT(*) FROM {where} til3
+                WHERE til3.`{event_col}` = @event_type
+                  AND til3.`{transaction_col}` = til1.`{transaction_col}`
+            ) AS transaction_row_count
         FROM {where} til1
         WHERE {' AND '.join(filters)}
         {order_by}
@@ -423,7 +441,17 @@ def fetch_held_events(
             transaction_id=clean(record["transaction_id"]),
             order_number=clean(record["order_number"]),
             event_timestamp=clean(record["event_timestamp"]),
+            transaction_row_count=int(record["transaction_row_count"] or 0),
         )
+        if 0 < max_rows_per_transaction < base.transaction_row_count:
+            base.action = "retry_limit_reached"
+            base.error = (
+                f"transactionId appears in {base.transaction_row_count} "
+                f"{EVENT_TYPE} rows, over the limit of {max_rows_per_transaction}."
+            )
+            rows.append(base)
+            continue
+
         payload = parse_payload(record["payload"])
         if payload is None:
             base.error = f"{payload_col} is empty or not valid JSON."
@@ -454,6 +482,8 @@ def fetch_held_events(
 
     columns = {
         "transaction": transaction_col,
+        "event": event_col,
+        "warning": warning_col,
         "reprocess": reprocess_col,
         "reprocess_type": column_data_type(schema, reprocess_col) if reprocess_col else "",
     }
@@ -509,14 +539,25 @@ def mark_to_be_reprocessed(
     transaction_ids = dedupe(row.transaction_id for row in rows)
     if not transaction_ids:
         return 0, f"No {transaction_col} was returned by the query, so no row can be identified."
-    sql = (
-        f"UPDATE {table} SET `{reprocess_col}` = {value} "
-        f"WHERE CAST(`{transaction_col}` AS STRING) IN UNNEST(@transaction_ids)"
-    )
+
+    # The transactionId is shared by every row of the same transaction, including other
+    # event types, retries and request/response pairs. The two predicates below keep the
+    # update inside the set of rows the SELECT returned, so those siblings stay untouched.
+    sql = f"""
+        UPDATE {table}
+        SET `{reprocess_col}` = {value}
+        WHERE CAST(`{transaction_col}` AS STRING) IN UNNEST(@transaction_ids)
+          AND `{columns['event']}` = @event_type
+          AND `{columns['warning']}` LIKE @warning_like
+    """
 
     updated = 0
     for batch in chunked(transaction_ids, batch_size):
-        params: List[Any] = [bigquery.ArrayQueryParameter("transaction_ids", "STRING", batch)]
+        params: List[Any] = [
+            bigquery.ArrayQueryParameter("transaction_ids", "STRING", batch),
+            bigquery.ScalarQueryParameter("event_type", "STRING", EVENT_TYPE),
+            bigquery.ScalarQueryParameter("warning_like", "STRING", WARNING_MESSAGE_LIKE),
+        ]
         try:
             job = client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=params))
             job.result()
@@ -661,7 +702,7 @@ class KiboClient:
 
 CSV_FIELDS = [
     "transaction_id", "order_number", "external_order_id", "tenant_id", "site_id",
-    "shipment_number", "event_timestamp",
+    "shipment_number", "event_timestamp", "transaction_row_count",
     "action", "success", "error", "response_excerpt", "correlation_id",
     "marked_to_be_reprocessed",
 ]
@@ -680,17 +721,20 @@ def write_csv(path: Path, rows: Sequence[Row]) -> None:
 def write_job_summary(
     rows: Sequence[Row], events_read: int, updated: int, update_error: str, dry_run: bool
 ) -> None:
+    """Condensed report for the Actions job summary."""
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not summary_path:
         return
     eligible = [r for r in rows if r.shipment_number]
     released = [r for r in eligible if r.action == "released" and r.success]
-    failed = [r for r in rows if r.error]
+    over_limit = [r for r in rows if r.action == "retry_limit_reached"]
+    failed = [r for r in rows if r.error and r.action != "retry_limit_reached"]
     lines = [
         "## Release shipments held with exchange",
         "",
         f"- Mode: **{'dry run' if dry_run else 'live'}**",
         f"- Events read from {TIL_EVENTS_TABLE}: **{events_read}**",
+        f"- Over the retry limit, left alone: **{len(over_limit)}**",
         f"- Shipments to release: **{len(eligible)}**",
         f"- Released: **{len(released)}**",
         f"- With an error: **{len(failed)}**",
@@ -726,6 +770,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=0, help="Limit the number of events read (0 = no limit).")
     parser.add_argument("--order-numbers", default="",
                         help="Optional comma or whitespace separated orderNumbers to restrict the run.")
+    parser.add_argument("--max-rows-per-transaction", type=int, default=DEFAULT_MAX_ROWS_PER_TRANSACTION,
+                        help="Retry limit: skip a transactionId that already appears in more than this "
+                             f"many {EVENT_TYPE} rows (0 = no limit).")
     parser.add_argument("--include-already-marked", action="store_true",
                         help="Also process events whose toBeReprocessed flag is already true.")
     parser.add_argument("--mark-scope", choices=("released", "all", "none"), default="released",
@@ -743,6 +790,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--batch-size must be at least 1.")
     if args.max_retries < 1:
         parser.error("--max-retries must be at least 1.")
+    if args.max_rows_per_transaction < 0:
+        parser.error("--max-rows-per-transaction cannot be negative (0 = no limit).")
     args.host = re.sub(r"^https?://", "", args.host.strip()).split("/", 1)[0].rstrip(".")
     return args
 
@@ -780,6 +829,11 @@ def main() -> int:
     log(f"Mode: {'DRY RUN' if args.dry_run else 'LIVE'}")
     log(f"Kibo host: {args.host}")
     log(f"Mark scope: {args.mark_scope}")
+    log(
+        "Retry limit: "
+        + (f"at most {args.max_rows_per_transaction} {EVENT_TYPE} row(s) per transactionId"
+           if args.max_rows_per_transaction > 0 else "none")
+    )
 
     kibo_credentials = load_json_env("KIBO_API_CREDS")
     client_id = clean(kibo_credentials.get("client_id"))
@@ -794,10 +848,14 @@ def main() -> int:
         log(f"Restricting the run to {len(only_order_numbers)} orderNumber(s).")
 
     rows, columns, events_read = fetch_held_events(
-        wlfs_client, only_order_numbers, args.limit, args.include_already_marked
+        wlfs_client, only_order_numbers, args.limit, args.include_already_marked,
+        args.max_rows_per_transaction,
     )
     eligible = [row for row in rows if row.shipment_number]
+    over_limit = [row for row in rows if row.action == "retry_limit_reached"]
     log(f"Events held with exchange: {events_read}")
+    if over_limit:
+        log(f"Over the retry limit, left alone: {len(over_limit)}")
     log(f"Shipments to release: {len(eligible)}")
     for row in rows:
         if not row.shipment_number:
@@ -853,11 +911,22 @@ def main() -> int:
     if args.dry_run:
         log(f"DRY RUN: {len(to_mark)} event row(s) would be flagged toBeReprocessed = TRUE.")
     elif to_mark:
+        expected = len(dedupe(row.transaction_id for row in to_mark))
         updated, update_error = mark_to_be_reprocessed(wlfs_client, columns, to_mark, args.batch_size)
         if update_error:
             warn(f"Could not flag the events: {update_error}")
         else:
-            log(f"Flagged toBeReprocessed = TRUE on {updated} BigQuery row(s).")
+            log(f"Flagged toBeReprocessed = TRUE on {updated} BigQuery row(s) "
+                f"for {expected} transactionId(s).")
+            if updated != expected:
+                warn(
+                    f"Flagged {updated} row(s) for {expected} transactionId(s): "
+                    + (
+                        "some transactions carry several held events."
+                        if updated > expected
+                        else "some rows were already flagged or are still in the streaming buffer."
+                    )
+                )
             for row in to_mark:
                 row.marked_to_be_reprocessed = True
     else:
@@ -866,12 +935,13 @@ def main() -> int:
     write_csv(output_path, rows)
     write_job_summary(rows, events_read, updated, update_error, args.dry_run)
 
-    failures = [row for row in rows if row.error]
+    failures = [row for row in rows if row.error and row.action != "retry_limit_reached"]
     log(f"Results written to {output_path}")
     log(
         f"Summary: {events_read} events, {len(eligible)} shipments, "
         f"{sum(1 for r in eligible if r.action == 'released' and r.success)} released, "
-        f"{len(failures)} with an error, {updated} rows flagged."
+        f"{len(failures)} with an error, {len(over_limit)} over the retry limit, "
+        f"{updated} rows flagged."
     )
     if update_error:
         return 2
