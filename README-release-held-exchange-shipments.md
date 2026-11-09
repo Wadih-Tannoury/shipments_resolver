@@ -36,7 +36,7 @@ The service account needs BigQuery **Job User** on the project and **Data Editor
      AND NOT EXISTS (
          SELECT 1 FROM `tlg-wlfs-prd`.til.prd_tilEvents til2
          WHERE til2.eventType = 'shipment.itemscanceled'
-           AND til2.warningMessage IS NULL
+           AND (til2.warningMessage IS NULL OR til2.warningMessage = '')
            AND til2.orderNumber = til1.orderNumber
      )
    ORDER BY eventTimestamp DESC
@@ -46,7 +46,16 @@ The service account needs BigQuery **Job User** on the project and **Data Editor
    keep re-sending yesterday's shipments. Pass `--include-already-marked` to process them
    anyway.
 
-2. Reads out of the `requestPayload` column of each row:
+2. Drops the events that hit the **retry limit**: a `transactionId` that already appears
+   in more than `--max-rows-per-transaction` (default 2) `shipment.itemscanceled` rows has
+   been attempted enough, so it is reported as `retry_limit_reached` and neither released
+   nor flagged. The count is taken over the whole event type rather than over the filtered
+   set, because an earlier attempt is usually already flagged `toBeReprocessed` and would
+   otherwise be invisible; other event types sharing the same `transactionId` are excluded
+   so they cannot inflate it. Such an event needs a look by hand — repeated holds mean the
+   `holdExchangeProcess` flip is not sticking. `0` disables the limit.
+
+3. Reads out of the `requestPayload` column of each row:
 
    | Value | Payload field |
    | --- | --- |
@@ -62,7 +71,7 @@ The service account needs BigQuery **Job User** on the project and **Data Editor
    payload has no `entityId`, no tenant or no site is reported as `skipped` with the
    missing fields named, and is never flagged for reprocessing.
 
-3. Per shipment number:
+4. Per shipment number:
 
    ```
    PUT https://t{tenantId}.tp3.mozu.com/api/commerce/shipments/{shipmentNumber}/data?merge=true
@@ -74,18 +83,26 @@ The service account needs BigQuery **Job User** on the project and **Data Editor
 
    Note the host carries only the tenant; the site travels in the header.
 
-4. Sets `toBeReprocessed = TRUE` on the events from step 1, identified by the
+5. Sets `toBeReprocessed = TRUE` on the events from step 1, identified by the
    `transactionId` column:
 
    ```sql
    UPDATE `tlg-wlfs-prd.til.prd_tilEvents`
    SET toBeReprocessed = TRUE
    WHERE CAST(transactionId AS STRING) IN UNNEST(@transaction_ids)
+     AND eventType = 'shipment.itemscanceled'
+     AND warningMessage LIKE '%Shipment held with exchange%'
    ```
 
-   Only the rows the query actually returned are touched, so another event sharing the
-   same order number is left alone. The flag is written as `TRUE`, `1` or `'true'`
-   depending on the column's declared type.
+   The last two predicates matter: a `transactionId` is shared by every row of the same
+   transaction, including other event types, retries and request/response pairs, so
+   without them the update reaches well beyond the rows the query returned. The flag is
+   written as `TRUE`, `1` or `'true'` depending on the column's declared type.
+
+   The run logs how many rows were flagged against how many transactionIds, and warns when
+   the two differ. More rows than transactionIds means a transaction carries several held
+   events; fewer means some rows were already flagged or are still in the streaming
+   buffer.
 
    By default (`--mark-scope released`) an event is flagged only when **all** of its
    shipments were released, so a partial failure is retried on the next run instead of
@@ -108,7 +125,8 @@ triggers. For a manual run: Actions → **Shipments resolver** → Run workflow,
 | `numbers` | empty | Comma separated `orderNumber`s to restrict the run |
 | `limit` | `0` | Cap on the number of events (0 = no limit) |
 | `kibo_host` | `tp3.mozu.com` | Kibo host suffix |
-| `mark_scope` | `released` | `released`, `all` or `none` (see step 4) |
+| `mark_scope` | `released` | `released`, `all` or `none` (see step 5) |
+| `max_rows_per_transaction` | `2` | Retry limit per `transactionId` (0 = no limit) |
 | `include_already_marked` | `false` | Also process events already flagged |
 
 The `warehouse` and `oms_status` inputs belong to the GXO job and are ignored here.
@@ -128,11 +146,12 @@ python release_held_exchange_shipments.py --dry-run
 ## Output
 
 Every run uploads `release-held-exchange-shipments-results`, a CSV with one row per
-shipment: the transactionId, order number, externalOrderId, tenant, site, shipment
-number, event timestamp, the action taken, any error, the Kibo response excerpt, the
-correlation id sent as `x-vol-correlation`, and whether the event was flagged. A
-condensed table also goes to the job summary. The job exits with code 2 when any shipment
-failed or the update could not be applied, so a bad run is visible in the Actions list.
+shipment: the transactionId, order number, externalOrderId, tenant, site, shipment number,
+event timestamp, the attempt count behind the retry limit, the action taken, any error,
+the Kibo response excerpt, the correlation id sent as `x-vol-correlation`, and whether the
+event was flagged. A condensed table also goes to the job summary. The job exits with code
+2 when any shipment failed or the update could not be applied; reaching the retry limit is
+not counted as a failure, so a permanently stuck order does not turn every daily run red.
 
 ## Notes
 
