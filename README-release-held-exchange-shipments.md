@@ -9,8 +9,11 @@ those events in BigQuery so they get reprocessed.
 ```
 release_held_exchange_shipments.py
 requirements.txt
-.github/workflows/release-held-exchange-shipments.yml
+.github/workflows/shipments-resolver.yml
 ```
+
+`shipments-resolver.yml` is the single workflow for every script in the repository; this
+one is the `release-held-exchange` job inside it.
 
 ## Repository secrets
 
@@ -87,17 +90,21 @@ cached per `tenantId`, refreshed on 401, with backoff on 429/5xx.
 
 ## Running it
 
-It runs on its own every day at **06:00 UTC**. For a manual run:
-Actions → **Release shipments held with exchange** → Run workflow.
+It runs on its own every day at **06:00 UTC**, which is the only script the schedule
+triggers. For a manual run: Actions → **Shipments resolver** → Run workflow, with
+`scripts` set to `release-held-exchange` (or `both`).
 
 | Input | Default | Notes |
 | --- | --- | --- |
+| `scripts` | `release-held-exchange` | Set to `both` to also run the GXO script |
 | `dry_run` | `false` | Reads and reports everything, calls neither Kibo nor the update |
-| `mark_scope` | `released` | `released`, `all` or `none` (see step 4) |
-| `include_already_marked` | `false` | Also process events already flagged |
-| `order_numbers` | empty | Comma separated list to restrict the run |
+| `numbers` | empty | Comma separated `orderNumber`s to restrict the run |
 | `limit` | `0` | Cap on the number of events (0 = no limit) |
 | `kibo_host` | `tp3.mozu.com` | Kibo host suffix |
+| `mark_scope` | `released` | `released`, `all` or `none` (see step 4) |
+| `include_already_marked` | `false` | Also process events already flagged |
+
+The `warehouse` and `oms_status` inputs belong to the GXO job and are ignored here.
 
 Before the first live run, trigger it once with `dry_run` on and check the artifact: it
 shows the exact URL, tenant, site and shipment numbers that would be called.
@@ -129,5 +136,5 @@ failed or the update could not be applied, so a bad run is visible in the Action
 - BigQuery cannot run DML against rows still in the streaming buffer (roughly the last 30
   minutes of inserts). Such an event simply stays unflagged and is picked up by the next
   daily run.
-- `concurrency` keeps two runs from overlapping, so a manual run during the scheduled one
-  queues instead of double-sending.
+- `concurrency` is shared by every job in `shipments-resolver.yml`, so a manual run during
+  the scheduled one queues instead of double-sending.
