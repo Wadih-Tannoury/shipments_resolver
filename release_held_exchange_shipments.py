@@ -31,7 +31,8 @@ Pipeline
 
        {"holdExchangeProcess": false}
 
-4. Back in BigQuery, set `toBeReprocessed = TRUE` on the rows returned by step 1.
+4. Back in BigQuery, set `toBeReprocessed = TRUE` on the rows returned by step 1,
+   identified by their `transactionId`.
 
 Credentials come from environment variables (GitHub repository secrets):
     TIL_BIGQUERY_CREDS  service account JSON for tlg-wlfs-prd
@@ -91,11 +92,8 @@ TIMESTAMP_CANDIDATES = (
     "ingestionTimestamp", "ingestion_timestamp", "createdAt", "created_at",
     "creationDate", "creation_date", "loadTimestamp", "load_timestamp",
 )
-# Used to update exactly the rows the SELECT returned, when such a column exists.
-ROW_KEY_CANDIDATES = (
-    "eventId", "event_id", "id", "messageId", "message_id", "eventUuid", "event_uuid",
-    "uuid", "correlationId", "correlation_id", "eventKey", "event_key",
-)
+# Identifies the rows to flag in step 4.
+TRANSACTION_ID_CANDIDATES = ("transactionId", "transaction_id")
 
 TRUE_STRINGS = {"TRUE", "T", "1", "Y", "YES"}
 
@@ -337,7 +335,7 @@ def shipment_numbers_of(payload: Any) -> List[str]:
 @dataclass
 class Row:
     """One (BigQuery row, shipmentNumber) pair."""
-    row_key: str = ""
+    transaction_id: str = ""
     order_number: str = ""
     external_order_id: str = ""
     tenant_id: str = ""
@@ -365,7 +363,7 @@ def fetch_held_events(
     """
     Run the held-with-exchange query.
 
-    Returns (rows, column names used by the update step, number of BigQuery rows read).
+    Returns (rows, the column names the update step needs, number of BigQuery rows read).
     One BigQuery row produces one Row per shipmentNumber found in its requestPayload,
     and one Row carrying the parsing error when nothing usable is in there.
     """
@@ -376,7 +374,7 @@ def fetch_held_events(
     event_col = resolve_column(schema, EVENT_TYPE_CANDIDATES, where)
     warning_col = resolve_column(schema, WARNING_CANDIDATES, where)
     ts_col = resolve_column(schema, TIMESTAMP_CANDIDATES, where, required=False)
-    key_col = resolve_column(schema, ROW_KEY_CANDIDATES, where, required=False)
+    transaction_col = resolve_column(schema, TRANSACTION_ID_CANDIDATES, where)
     reprocess_col = resolve_column(schema, REPROCESS_CANDIDATES, where, required=False)
 
     filters = [
@@ -399,12 +397,12 @@ def fetch_held_events(
     if reprocess_col and not include_already_marked:
         filters.append(not_marked_predicate(f"til1.`{reprocess_col}`", column_data_type(schema, reprocess_col)))
 
-    key_select = f"CAST(til1.`{key_col}` AS STRING)" if key_col else "CAST(NULL AS STRING)"
+    transaction_select = f"CAST(til1.`{transaction_col}` AS STRING)"
     ts_select = f"CAST(til1.`{ts_col}` AS STRING)" if ts_col else "CAST(NULL AS STRING)"
     order_by = f"ORDER BY til1.`{ts_col}` DESC" if ts_col else ""
     sql = f"""
         SELECT
-            {key_select} AS row_key,
+            {transaction_select} AS transaction_id,
             CAST(til1.`{order_col}` AS STRING) AS order_number,
             CAST(til1.`{payload_col}` AS STRING) AS payload,
             {ts_select} AS event_timestamp
@@ -422,7 +420,7 @@ def fetch_held_events(
     for record in job.result():
         read += 1
         base = Row(
-            row_key=clean(record["row_key"]),
+            transaction_id=clean(record["transaction_id"]),
             order_number=clean(record["order_number"]),
             event_timestamp=clean(record["event_timestamp"]),
         )
@@ -455,10 +453,7 @@ def fetch_held_events(
             rows.append(row)
 
     columns = {
-        "order": order_col,
-        "event": event_col,
-        "warning": warning_col,
-        "key": key_col,
+        "transaction": transaction_col,
         "reprocess": reprocess_col,
         "reprocess_type": column_data_type(schema, reprocess_col) if reprocess_col else "",
     }
@@ -496,9 +491,8 @@ def mark_to_be_reprocessed(
     """
     Set toBeReprocessed = TRUE on the given BigQuery rows.
 
-    When the table has a usable identifier column the update targets those identifiers.
-    Otherwise it replays the original predicate, restricted to the order numbers that
-    were processed, which is the same set of rows the SELECT returned.
+    The rows are identified by the transactionId values the SELECT returned, so exactly
+    those rows are touched and nothing else that shares an order number.
 
     Returns (rows updated, error).
     """
@@ -510,41 +504,19 @@ def mark_to_be_reprocessed(
             "so the rows cannot be flagged."
         )
     value = reprocess_true_literal(columns["reprocess_type"])
-    key_col = columns["key"]
+    transaction_col = columns["transaction"]
 
-    if key_col:
-        keys = dedupe(row.row_key for row in rows)
-        if not keys:
-            return 0, "No row identifier was returned by the query."
-        sql = f"UPDATE {table} SET `{reprocess_col}` = {value} WHERE CAST(`{key_col}` AS STRING) IN UNNEST(@keys)"
-        parameter_name, values = "keys", keys
-    else:
-        order_numbers = dedupe(row.order_number for row in rows)
-        if not order_numbers:
-            return 0, "No order number was returned by the query."
-        sql = f"""
-            UPDATE {table} til1
-            SET `{reprocess_col}` = {value}
-            WHERE til1.`{columns['event']}` = @event_type
-              AND til1.`{columns['warning']}` LIKE @warning_like
-              AND CAST(til1.`{columns['order']}` AS STRING) IN UNNEST(@keys)
-              AND NOT EXISTS (
-                  SELECT 1 FROM {table} til2
-                  WHERE til2.`{columns['event']}` = @event_type
-                    AND til2.`{columns['warning']}` IS NULL
-                    AND til2.`{columns['order']}` = til1.`{columns['order']}`
-              )
-        """
-        parameter_name, values = "keys", order_numbers
+    transaction_ids = dedupe(row.transaction_id for row in rows)
+    if not transaction_ids:
+        return 0, f"No {transaction_col} was returned by the query, so no row can be identified."
+    sql = (
+        f"UPDATE {table} SET `{reprocess_col}` = {value} "
+        f"WHERE CAST(`{transaction_col}` AS STRING) IN UNNEST(@transaction_ids)"
+    )
 
     updated = 0
-    for batch in chunked(values, batch_size):
-        params: List[Any] = [bigquery.ArrayQueryParameter(parameter_name, "STRING", batch)]
-        if not key_col:
-            params += [
-                bigquery.ScalarQueryParameter("event_type", "STRING", EVENT_TYPE),
-                bigquery.ScalarQueryParameter("warning_like", "STRING", WARNING_MESSAGE_LIKE),
-            ]
+    for batch in chunked(transaction_ids, batch_size):
+        params: List[Any] = [bigquery.ArrayQueryParameter("transaction_ids", "STRING", batch)]
         try:
             job = client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=params))
             job.result()
@@ -688,7 +660,7 @@ class KiboClient:
 # ---------------------------------------------------------------------------
 
 CSV_FIELDS = [
-    "row_key", "order_number", "external_order_id", "tenant_id", "site_id",
+    "transaction_id", "order_number", "external_order_id", "tenant_id", "site_id",
     "shipment_number", "event_timestamp",
     "action", "success", "error", "response_excerpt", "correlation_id",
     "marked_to_be_reprocessed",
@@ -759,7 +731,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mark-scope", choices=("released", "all", "none"), default="released",
                         help="Which events get toBeReprocessed = TRUE: only those whose shipments were all "
                              "released (default), every event returned by the query, or none.")
-    parser.add_argument("--batch-size", type=int, default=500, help="Identifiers per BigQuery update statement.")
+    parser.add_argument("--batch-size", type=int, default=500,
+                        help="transactionId values per BigQuery update statement.")
     parser.add_argument("--timeout", type=float, default=60.0, help="HTTP timeout in seconds.")
     parser.add_argument("--max-retries", type=int, default=3, help="Maximum attempts per Kibo request.")
     parser.add_argument("--sleep-between-requests", type=float, default=0.2,
@@ -789,9 +762,9 @@ def rows_to_mark(rows: Sequence[Row], scope: str) -> List[Row]:
         return []
     if scope == "all":
         return list(rows)
-    by_event: Dict[Tuple[str, str], List[Row]] = {}
+    by_event: Dict[str, List[Row]] = {}
     for row in rows:
-        by_event.setdefault((row.row_key, row.order_number), []).append(row)
+        by_event.setdefault(row.transaction_id, []).append(row)
     marked: List[Row] = []
     for group in by_event.values():
         if all(row.shipment_number and row.success for row in group):
@@ -828,7 +801,7 @@ def main() -> int:
     log(f"Shipments to release: {len(eligible)}")
     for row in rows:
         if not row.shipment_number:
-            warn(f"{row.order_number or row.row_key or '(unknown event)'}: {row.error}")
+            warn(f"{row.transaction_id or row.order_number or '(unknown event)'}: {row.error}")
 
     if not eligible:
         log("Nothing to release.")
