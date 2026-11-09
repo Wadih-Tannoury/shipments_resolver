@@ -9,9 +9,6 @@ name: Shipments resolver
 # add it to the `if:` condition of its job below.
 
 on:
-  schedule:
-    # Every day at 06:00 UTC.
-    - cron: "0 6 * * *"
   workflow_dispatch:
     inputs:
       scripts:
