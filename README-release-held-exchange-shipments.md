@@ -74,11 +74,18 @@ The service account needs BigQuery **Job User** on the project and **Data Editor
 
    Note the host carries only the tenant; the site travels in the header.
 
-4. Sets `toBeReprocessed = TRUE` on the events from step 1. When `prd_tilEvents` has an
-   identifier column (`eventId`, `id`, `messageId`…) the update targets exactly those
-   rows; otherwise it replays the step 1 predicate restricted to the order numbers that
-   were processed. The column is written as `TRUE`, `1` or `'true'` depending on its
-   declared type.
+4. Sets `toBeReprocessed = TRUE` on the events from step 1, identified by the
+   `transactionId` column:
+
+   ```sql
+   UPDATE `tlg-wlfs-prd.til.prd_tilEvents`
+   SET toBeReprocessed = TRUE
+   WHERE CAST(transactionId AS STRING) IN UNNEST(@transaction_ids)
+   ```
+
+   Only the rows the query actually returned are touched, so another event sharing the
+   same order number is left alone. The flag is written as `TRUE`, `1` or `'true'`
+   depending on the column's declared type.
 
    By default (`--mark-scope released`) an event is flagged only when **all** of its
    shipments were released, so a partial failure is retried on the next run instead of
@@ -121,7 +128,7 @@ python release_held_exchange_shipments.py --dry-run
 ## Output
 
 Every run uploads `release-held-exchange-shipments-results`, a CSV with one row per
-shipment: the event identifier, order number, externalOrderId, tenant, site, shipment
+shipment: the transactionId, order number, externalOrderId, tenant, site, shipment
 number, event timestamp, the action taken, any error, the Kibo response excerpt, the
 correlation id sent as `x-vol-correlation`, and whether the event was flagged. A
 condensed table also goes to the job summary. The job exits with code 2 when any shipment
@@ -130,7 +137,8 @@ failed or the update could not be applied, so a bad run is visible in the Action
 ## Notes
 
 - Column names are resolved case-insensitively against `INFORMATION_SCHEMA.COLUMNS`, so
-  `requestPayload` / `request_payload` and `orderNumber` / `order_number` both work. If
+  `requestPayload` / `request_payload` and `transactionId` / `transaction_id` both work.
+  A missing `transactionId` stops the run up front, since nothing could be flagged. If
   no `toBeReprocessed`-style column exists, the releases still happen and the update step
   reports the missing column rather than failing silently.
 - BigQuery cannot run DML against rows still in the streaming buffer (roughly the last 30
