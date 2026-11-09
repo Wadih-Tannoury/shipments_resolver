@@ -1,43 +1,135 @@
-name: Fulfill GXO shipments in Kibo
+name: Shipments resolver
+
+# One workflow for every script in this repository.
+#
+#   release-held-exchange : release_held_exchange_shipments.py  (runs daily, see schedule)
+#   fulfill-gxo           : fulfill_gxo_shipments.py            (manual only)
+#
+# The schedule runs only release-held-exchange. To put another script on the schedule,
+# add it to the `if:` condition of its job below.
 
 on:
+  schedule:
+    # Every day at 06:00 UTC.
+    - cron: "0 6 * * *"
   workflow_dispatch:
     inputs:
+      scripts:
+        description: "Which script(s) to run"
+        type: choice
+        options:
+          - release-held-exchange
+          - fulfill-gxo
+          - both
+        default: release-held-exchange
       dry_run:
-        description: "Dry run: run all checks and read each shipment, but do not call /fulfilled"
+        description: "Dry run: run every check and read, but perform no write"
         type: boolean
         default: false
-      warehouse:
-        description: "Warehouse on the SHIPPED event"
-        type: string
-        default: "GXO"
-      oms_status:
-        description: "shipmentStatus to keep in oms_active_shipments (empty = no filter)"
-        type: string
-        default: "READY"
-      shipment_order_numbers:
-        description: "Optional: comma separated shipmentOrderNumbers to restrict the run"
+      numbers:
+        description: "Optional: comma separated numbers to restrict the run (orderNumbers for release-held-exchange, shipmentOrderNumbers for fulfill-gxo)"
         type: string
         default: ""
       limit:
-        description: "Optional: maximum number of active shipments to process (0 = no limit)"
+        description: "Optional: maximum number of rows to process (0 = no limit)"
         type: string
         default: "0"
       kibo_host:
         description: "Kibo host suffix"
         type: string
         default: "tp3.mozu.com"
+      mark_scope:
+        description: "release-held-exchange: which events get toBeReprocessed = TRUE"
+        type: choice
+        options:
+          - released
+          - all
+          - none
+        default: released
+      include_already_marked:
+        description: "release-held-exchange: also process events already flagged toBeReprocessed"
+        type: boolean
+        default: false
+      warehouse:
+        description: "fulfill-gxo: warehouse on the SHIPPED event"
+        type: string
+        default: "GXO"
+      oms_status:
+        description: "fulfill-gxo: shipmentStatus to keep in oms_active_shipments (empty = no filter)"
+        type: string
+        default: "READY"
 
 concurrency:
-  group: fulfill-gxo-shipments
+  group: shipments-resolver
   cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
-  fulfill:
-    name: ${{ inputs.dry_run && 'Dry run' || 'Fulfill' }}
+  release-held-exchange:
+    name: Release shipments held with exchange${{ inputs.dry_run && ' (dry run)' || '' }}
+    # Scheduled runs always include this script.
+    if: >-
+      github.event_name == 'schedule'
+      || inputs.scripts == 'release-held-exchange'
+      || inputs.scripts == 'both'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run
+        env:
+          TIL_BIGQUERY_CREDS: ${{ secrets.TIL_BIGQUERY_CREDS }}
+          KIBO_API_CREDS: ${{ secrets.KIBO_API_CREDS }}
+          INPUT_HOST: ${{ inputs.kibo_host || 'tp3.mozu.com' }}
+          INPUT_LIMIT: ${{ inputs.limit || '0' }}
+          INPUT_NUMBERS: ${{ inputs.numbers }}
+          INPUT_MARK_SCOPE: ${{ inputs.mark_scope || 'released' }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          INPUT_INCLUDE_MARKED: ${{ inputs.include_already_marked }}
+        run: |
+          DRY_RUN_FLAG=""
+          if [ "$INPUT_DRY_RUN" = "true" ]; then DRY_RUN_FLAG="--dry-run"; fi
+          INCLUDE_MARKED_FLAG=""
+          if [ "$INPUT_INCLUDE_MARKED" = "true" ]; then INCLUDE_MARKED_FLAG="--include-already-marked"; fi
+          python release_held_exchange_shipments.py \
+            $DRY_RUN_FLAG \
+            $INCLUDE_MARKED_FLAG \
+            --host "$INPUT_HOST" \
+            --limit "$INPUT_LIMIT" \
+            --order-numbers "$INPUT_NUMBERS" \
+            --mark-scope "$INPUT_MARK_SCOPE" \
+            --output "release_held_exchange_shipments_results.csv"
+
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-held-exchange-shipments-results
+          path: release_held_exchange_shipments_results.csv
+          if-no-files-found: warn
+          retention-days: 30
+
+  fulfill-gxo:
+    name: Fulfill GXO shipments in Kibo${{ inputs.dry_run && ' (dry run)' || '' }}
+    # Manual runs only. Add `github.event_name == 'schedule' ||` to put it on the schedule.
+    if: >-
+      inputs.scripts == 'fulfill-gxo'
+      || inputs.scripts == 'both'
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -60,11 +152,11 @@ jobs:
           BI_BIGQUERY_CREDS: ${{ secrets.BI_BIGQUERY_CREDS }}
           TIL_BIGQUERY_CREDS: ${{ secrets.TIL_BIGQUERY_CREDS }}
           KIBO_API_CREDS: ${{ secrets.KIBO_API_CREDS }}
-          INPUT_WAREHOUSE: ${{ inputs.warehouse }}
+          INPUT_WAREHOUSE: ${{ inputs.warehouse || 'GXO' }}
           INPUT_OMS_STATUS: ${{ inputs.oms_status }}
-          INPUT_HOST: ${{ inputs.kibo_host }}
-          INPUT_LIMIT: ${{ inputs.limit }}
-          INPUT_NUMBERS: ${{ inputs.shipment_order_numbers }}
+          INPUT_HOST: ${{ inputs.kibo_host || 'tp3.mozu.com' }}
+          INPUT_LIMIT: ${{ inputs.limit || '0' }}
+          INPUT_NUMBERS: ${{ inputs.numbers }}
           INPUT_DRY_RUN: ${{ inputs.dry_run }}
         run: |
           DRY_RUN_FLAG=""
