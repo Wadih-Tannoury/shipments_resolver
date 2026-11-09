@@ -6,14 +6,18 @@ already shipped and for which an invoice document exists.
 ## Repository layout
 
 ```
-README.md
+README-fulfill-gxo-shipments.md
+README-release-held-exchange-shipments.md
 fulfill_gxo_shipments.py
+release_held_exchange_shipments.py
 requirements.txt
-.github/workflows/fulfill-gxo-shipments.yml
+.github/workflows/shipments-resolver.yml
 ```
 
 Everything sits at the repository root. The workflow file has to live under
 `.github/workflows/` — GitHub only picks up workflows from that path.
+`shipments-resolver.yml` triggers every script in the repository; this one is its
+`fulfill-gxo` job.
 
 ## Repository secrets
 
@@ -60,18 +64,23 @@ and cached per `tenantId`, with a refresh on 401 and backoff on 429/5xx.
 
 ## Running it
 
-Actions → **Fulfill GXO shipments in Kibo** → Run workflow.
+Actions → **Shipments resolver** → Run workflow, with `scripts` set to `fulfill-gxo`
+(or `both`). This script is not on the daily schedule; only `release-held-exchange` is.
 
 | Input | Default | Notes |
 | --- | --- | --- |
-| `dry_run` | `true` | Runs every check and reads each shipment, but never calls `/fulfilled` |
+| `scripts` | `release-held-exchange` | Set to `fulfill-gxo` or `both` to run this script |
+| `dry_run` | `false` | Runs every check and reads each shipment, but never calls `/fulfilled` |
 | `warehouse` | `GXO` | Warehouse filter on the SHIPPED event |
 | `oms_status` | `READY` | `shipmentStatus` kept from `oms_active_shipments`; leave empty to disable the filter |
-| `shipment_order_numbers` | empty | Comma separated list to restrict the run to specific shipments |
+| `numbers` | empty | Comma separated `shipmentOrderNumber`s to restrict the run |
 | `limit` | `0` | Cap on the number of active shipments (0 = no limit) |
 | `kibo_host` | `tp3.mozu.com` | Kibo host suffix |
 
-Start with `dry_run` left on, review the artifact, then re-run with it off.
+The `mark_scope` and `include_already_marked` inputs belong to the release job and are
+ignored here.
+
+Start with `dry_run` on, review the artifact, then re-run with it off.
 
 ## Running it locally
 
