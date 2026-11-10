@@ -1,110 +1,167 @@
-# Fulfill GXO shipments in Kibo
+# Release shipments held with exchange
 
-Manually triggered GitHub Actions workflow that fulfills Kibo shipments which GXO has
-already shipped and for which an invoice document exists.
+Daily GitHub Actions workflow that clears the exchange hold on Kibo shipments whose
+`shipment.itemscanceled` event came back with `Shipment held with exchange`, then flags
+those events in BigQuery so they get reprocessed.
 
 ## Repository layout
 
 ```
-README-fulfill-gxo-shipments.md
-README-release-held-exchange-shipments.md
-fulfill_gxo_shipments.py
 release_held_exchange_shipments.py
 requirements.txt
 .github/workflows/shipments-resolver.yml
 ```
 
-Everything sits at the repository root. The workflow file has to live under
-`.github/workflows/` — GitHub only picks up workflows from that path.
-`shipments-resolver.yml` triggers every script in the repository; this one is its
-`fulfill-gxo` job.
+`shipments-resolver.yml` is the single workflow for every script in the repository; this
+one is the `release-held-exchange` job inside it.
 
 ## Repository secrets
 
 | Secret | Content |
 | --- | --- |
-| `BI_BIGQUERY_CREDS` | Service account JSON for `tlg-business-intelligence-prd` |
 | `TIL_BIGQUERY_CREDS` | Service account JSON for `tlg-wlfs-prd` |
 | `KIBO_API_CREDS` | `{"client_id": "...", "client_secret": "..."}` |
 
-The two BigQuery secrets are the full service account JSON files, pasted as-is. Each
-service account needs BigQuery Job User on its own project and Data Viewer on the
-`til` dataset.
+The service account needs BigQuery **Job User** on the project and **Data Editor** on the
+`til` dataset. Data Viewer is not enough here: the last step is an `UPDATE` statement.
 
 ## What the run does
 
-1. Reads `shipment_order_number`, `tenant_id`, `site_id` from
-   `tlg-business-intelligence-prd.til.oms_active_shipments`, keeping only the rows whose
-   `shipmentStatus` is `READY`. Anything already fulfilled, cancelled or otherwise not
-   pending never reaches Kibo.
-2. Checks `tlg-wlfs-prd.til.prd_shipmentStatus` for a `SHIPPED` event with
-   `warehouse = 'GXO'`.
-3. Checks `tlg-wlfs-prd.til.prd_invoiceUpdate` for an `INVOICE_RESULT` whose
-   `requestPayload` contains at least one `documentLink` starting with `http`
-   (the payload is parsed in Python, so the link is found at any nesting depth).
-4. For the shipments that pass both checks, takes `data.logisticOrderNumber` from the
-   SHIPPED payload (`BB82902`), drops the first two characters and uses the rest as the
-   Kibo `shipmentNumber` (`82902`). A value that is not numeric after the prefix is
-   removed is reported as an error rather than sent to Kibo.
+1. Runs the held-with-exchange query against `tlg-wlfs-prd.til.prd_tilEvents`:
 
-   A shipment order number can be shipped in several parcels and therefore have several
-   SHIPPED events, each with its own `logisticOrderNumber` and its own Kibo shipment.
-   Every distinct one is fulfilled, and the CSV gets one row per Kibo shipment. The
-   reverse does not happen: a Kibo shipment belongs to exactly one shipment order number.
-5. Calls, per shipment:
-   - `GET  https://t{tenantId}-s{siteId}.tp3.mozu.com/api/commerce/shipments/{shipmentNumber}`
-   - `PUT  https://t{tenantId}-s{siteId}.tp3.mozu.com/api/commerce/shipments/{shipmentNumber}/fulfilled`
+   ```sql
+   SELECT ... FROM `tlg-wlfs-prd`.til.prd_tilEvents til1
+   WHERE til1.eventType = 'shipment.itemscanceled'
+     AND til1.warningMessage LIKE '%Shipment held with exchange%'
+     AND NOT EXISTS (
+         SELECT 1 FROM `tlg-wlfs-prd`.til.prd_tilEvents til2
+         WHERE til2.eventType = 'shipment.itemscanceled'
+           AND (til2.warningMessage IS NULL OR til2.warningMessage = '')
+           AND til2.orderNumber = til1.orderNumber
+     )
+   ORDER BY eventTimestamp DESC
+   ```
 
-   The `GET` is a last safety net: a shipment that Kibo already reports in a terminal
-   status (FULFILLED, CANCELED, CLOSED…) is reported as `already_terminal` and left alone,
-   which should be rare now that the status filter happens in BigQuery.
+   By default rows already flagged `toBeReprocessed` are left out, so a daily run does not
+   keep re-sending yesterday's shipments. Pass `--include-already-marked` to process them
+   anyway.
 
-Kibo tokens are obtained from `https://home.mozu.com/api/platform/applications/authtickets/oauth`
-and cached per `tenantId`, with a refresh on 401 and backoff on 429/5xx.
+2. Drops the events that hit the **retry limit**: a `transactionId` that already appears
+   in more than `--max-rows-per-transaction` (default 2) `shipment.itemscanceled` rows has
+   been attempted enough, so it is reported as `retry_limit_reached` and neither released
+   nor flagged. The count is taken over the whole event type rather than over the filtered
+   set, because an earlier attempt is usually already flagged `toBeReprocessed` and would
+   otherwise be invisible; other event types sharing the same `transactionId` are excluded
+   so they cannot inflate it. Such an event needs a look by hand — repeated holds mean the
+   `holdExchangeProcess` flip is not sticking. `0` disables the limit.
+
+3. Reads out of the `requestPayload` column of each row:
+
+   | Value | Payload field |
+   | --- | --- |
+   | `externalOrderId` | `orderNumber` |
+   | `shipmentNumber` list | `entityId` |
+   | `tenantId` | `x-vol-tenant` |
+   | `siteId` | `x-vol-site` |
+
+   Fields are looked up case-insensitively at any nesting depth, so `x-vol-tenant` is
+   found whether it sits at the top level, inside `headers`, or inside a list of header
+   objects. `entityId` may hold a single value, a list, or several ids in one separated
+   string; every distinct one becomes its own Kibo call and its own CSV row. A row whose
+   payload has no `entityId`, no tenant or no site is reported as `skipped` with the
+   missing fields named, and is never flagged for reprocessing.
+
+4. Per shipment number:
+
+   ```
+   PUT https://t{tenantId}.tp3.mozu.com/api/commerce/shipments/{shipmentNumber}/data?merge=true
+   x-vol-tenant: {tenantId}
+   x-vol-site:   {siteId}
+
+   {"holdExchangeProcess": false}
+   ```
+
+   Note the host carries only the tenant; the site travels in the header.
+
+5. Sets `toBeReprocessed = TRUE` on the events from step 1, identified by the
+   `transactionId` column:
+
+   ```sql
+   UPDATE `tlg-wlfs-prd.til.prd_tilEvents`
+   SET toBeReprocessed = TRUE
+   WHERE CAST(transactionId AS STRING) IN UNNEST(@transaction_ids)
+     AND eventType = 'shipment.itemscanceled'
+     AND warningMessage LIKE '%Shipment held with exchange%'
+   ```
+
+   The last two predicates matter: a `transactionId` is shared by every row of the same
+   transaction, including other event types, retries and request/response pairs, so
+   without them the update reaches well beyond the rows the query returned. The flag is
+   written as `TRUE`, `1` or `'true'` depending on the column's declared type.
+
+   The run logs how many rows were flagged against how many transactionIds, and warns when
+   the two differ. More rows than transactionIds means a transaction carries several held
+   events; fewer means some rows were already flagged or are still in the streaming
+   buffer.
+
+   By default (`--mark-scope released`) an event is flagged only when **all** of its
+   shipments were released, so a partial failure is retried on the next run instead of
+   being silently closed. `--mark-scope all` flags every event the query returned,
+   `--mark-scope none` flags nothing.
+
+Kibo tokens come from `https://home.mozu.com/api/platform/applications/authtickets/oauth`,
+cached per `tenantId`, refreshed on 401, with backoff on 429/5xx.
 
 ## Running it
 
-Actions → **Shipments resolver** → Run workflow, with `scripts` set to `fulfill-gxo`
-(or `all`). This script is not on the daily schedule; only `release-held-exchange` is.
+It runs on its own every day at **06:00 UTC**, which is the only script the schedule
+triggers. For a manual run: Actions → **Shipments resolver** → Run workflow, with
+`scripts` set to `release-held-exchange` (or `all`).
 
 | Input | Default | Notes |
 | --- | --- | --- |
-| `scripts` | `release-held-exchange` | Set to `fulfill-gxo` or `all` to run this script |
-| `dry_run` | `false` | Runs every check and reads each shipment, but never calls `/fulfilled` |
-| `warehouse` | `GXO` | Warehouse filter on the SHIPPED event |
-| `oms_status` | `READY` | `shipmentStatus` kept from `oms_active_shipments`; leave empty to disable the filter |
-| `numbers` | empty | Comma separated `shipmentOrderNumber`s to restrict the run |
-| `limit` | `0` | Cap on the number of active shipments (0 = no limit) |
+| `scripts` | `release-held-exchange` | Set to `all` to run every script |
+| `dry_run` | `false` | Reads and reports everything, calls neither Kibo nor the update |
+| `numbers` | empty | Comma separated `orderNumber`s to restrict the run |
+| `limit` | `0` | Cap on the number of events (0 = no limit) |
 | `kibo_host` | `tp3.mozu.com` | Kibo host suffix |
+| `mark_scope` | `released` | `released`, `all` or `none` (see step 5) |
+| `max_rows_per_transaction` | `2` | Retry limit per `transactionId` (0 = no limit) |
+| `include_already_marked` | `false` | Also process events already flagged |
 
-The `mark_scope` and `include_already_marked` inputs belong to the release job and are
-ignored here.
+The `warehouse` and `oms_status` inputs belong to the GXO job and are ignored here.
 
-Start with `dry_run` on, review the artifact, then re-run with it off.
+Before the first live run, trigger it once with `dry_run` on and check the artifact: it
+shows the exact URL, tenant, site and shipment numbers that would be called.
 
 ## Running it locally
 
 ```bash
 pip install -r requirements.txt
-export BI_BIGQUERY_CREDS="$(cat bi-service-account.json)"
 export TIL_BIGQUERY_CREDS="$(cat til-service-account.json)"
 export KIBO_API_CREDS="$(cat kibo_credentials.json)"
-python fulfill_gxo_shipments.py --dry-run
+python release_held_exchange_shipments.py --dry-run
 ```
 
 ## Output
 
-Every run uploads `fulfill-gxo-shipments-results` containing a CSV with one row per
-active shipment: the two BigQuery checks, the document link, the logistic order number,
-the OMS status, the derived Kibo shipment number, the Kibo status before and after, the action taken, and any
-error. A condensed table is also written to the job summary. The job exits with code 2 if
-any eligible shipment failed, so a failed run is visible in the Actions list.
+Every run uploads `release-held-exchange-shipments-results`, a CSV with one row per
+shipment: the transactionId, order number, externalOrderId, tenant, site, shipment number,
+event timestamp, the attempt count behind the retry limit, the action taken, any error,
+the Kibo response excerpt, the correlation id sent as `x-vol-correlation`, and whether the
+event was flagged. A condensed table also goes to the job summary. The job exits with code
+2 when any shipment failed or the update could not be applied; reaching the retry limit is
+not counted as a failure, so a permanently stuck order does not turn every daily run red.
 
-## Schema notes
+## Notes
 
-Column names are resolved case-insensitively against `INFORMATION_SCHEMA.COLUMNS`, so
-`shipmentOrderNumber` / `shipment_order_number` and `requestPayload` / `request_payload`
-both work. The script also looks for an event timestamp column to pick the most recent
-event per shipment; if none of the usual names exist, it takes the first row returned.
-If `prd_invoiceUpdate` has no `eventType` column, the event type is read from inside the
-payload instead.
+- Column names are resolved case-insensitively against `INFORMATION_SCHEMA.COLUMNS`, so
+  `requestPayload` / `request_payload` and `transactionId` / `transaction_id` both work.
+  A missing `transactionId` stops the run up front, since nothing could be flagged. If
+  no `toBeReprocessed`-style column exists, the releases still happen and the update step
+  reports the missing column rather than failing silently.
+- BigQuery cannot run DML against rows still in the streaming buffer (roughly the last 30
+  minutes of inserts). Such an event simply stays unflagged and is picked up by the next
+  daily run.
+- `concurrency` is shared by every job in `shipments-resolver.yml`, so a manual run during
+  the scheduled one queues instead of double-sending.
