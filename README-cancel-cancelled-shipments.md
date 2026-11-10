@@ -56,10 +56,18 @@ only need read access (Job User on their project, Data Viewer on the `til` datas
    - `PUT https://t{tenantId}.tp3.mozu.com/api/commerce/shipments/{shipmentNumber}/canceled`
 
      ```json
-     {"reasonCode": "No Inventory", "moreInfo": "No Inventory"}
+     {"canceledReason": {"reasonCode": "No Inventory", "moreInfo": "No Inventory"}}
      ```
 
-   Both carry `x-vol-tenant` and `x-vol-site`. The `GET` is a safety net: a shipment
+     The reason has to be nested under `canceledReason`, per the `CancelShipment`
+     schema. Kibo answers `200 OK` to a flat `{"reasonCode": ..., "moreInfo": ...}`
+     body but ignores it and records its own default reason (`Canceled`), so the run
+     looks successful while the Reason column in the admin UI is wrong.
+
+   After a successful cancellation the shipment is read back and the stored
+   `shipmentStatusReason.reasonCode` is written to the `kibo_reason_after` column; if
+   it differs from the reason that was sent, the run logs a warning. Both calls carry
+   `x-vol-tenant` and `x-vol-site`. The `GET` is a safety net: a shipment
    Kibo already reports as CANCELED, CLOSED, SHIPPED or otherwise terminal is reported
    as `already_terminal` and left alone, so re-running the job is harmless.
 
@@ -106,7 +114,7 @@ The job uploads `cancel_cancelled_shipments_results.csv` as an artifact (30 days
 writes a summary table to the run page. One row per Kibo shipment, with
 `oms_shipment_number`, `has_cancelled_event`, `has_picked_event`, `picked_quantity`,
 `reason_code`, `logistic_order_number`, `kibo_shipment_number`, `number_matches_oms`,
-the Kibo status before and after, the
+the Kibo status before and after, `kibo_reason_after`, the
 action (`canceled`, `would_cancel`, `already_terminal`, `skipped`, `read_failed`,
 `cancel_failed`), and the error when there is one.
 
