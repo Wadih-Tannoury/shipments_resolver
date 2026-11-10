@@ -6,7 +6,8 @@ Pipeline
 --------
 1. Read the active shipments from BigQuery (BI project):
        `tlg-business-intelligence-prd`.til.oms_active_shipments
-   keeping shipment_order_number, tenant_id, site_id.
+   keeping only the rows whose shipmentStatus is READY, and taking from them
+   shipment_order_number, the shipment number, tenant_id and site_id.
 
 2. For those shipment order numbers, read the events in the WLFS project:
        `tlg-wlfs-prd`.til.prd_shipmentStatus
@@ -731,8 +732,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dry-run", action="store_true",
                         help="Run every check and read each Kibo shipment, but do not call the canceled endpoint.")
-    parser.add_argument("--oms-status", default="",
-                        help="Keep only rows with this shipmentStatus in oms_active_shipments. Empty = no filter.")
+    parser.add_argument("--oms-status", default="READY",
+                        help="Keep only rows with this shipmentStatus in oms_active_shipments. "
+                             "Pass an empty string to disable the filter.")
     parser.add_argument("--no-picked-reason", default="skip", choices=("skip", "no-inventory", "customer"),
                         help="What to do when a CANCELLED shipment has no PICKED event at all.")
     parser.add_argument("--host", default=DEFAULT_HOST, help="Kibo host suffix.")
