@@ -33,10 +33,10 @@ only need read access (Job User on their project, Data Viewer on the `til` datas
 
 ## What the run does
 
-1. Reads `shipment_order_number`, `tenant_id`, `site_id` from
-   `tlg-business-intelligence-prd.til.oms_active_shipments`. Unlike `fulfill-gxo`,
-   no `shipmentStatus` filter is applied by default, because a cancelled shipment can
-   sit in several statuses; set **cancel_oms_status** to filter.
+1. Reads `shipment_order_number`, the shipment number, `tenant_id` and `site_id` from
+   `tlg-business-intelligence-prd.til.oms_active_shipments`, keeping only the rows
+   whose `shipmentStatus` is `READY`, same as the `fulfill-gxo` job. Anything already
+   cancelled, fulfilled or otherwise not pending never reaches Kibo.
 2. For those shipment order numbers, reads the `CANCELLED` and `PICKED` events from
    `tlg-wlfs-prd.til.prd_shipmentStatus` — the same join as the `fulfill-gxo` job.
    A shipment with no `CANCELLED` event is skipped. Both `CANCELLED` and `CANCELED`
@@ -94,7 +94,7 @@ once, skips the check, and marks those rows `unchecked`.
 | `numbers` | empty | Restrict the run to these `shipmentOrderNumber`s |
 | `limit` | `0` | Maximum rows read from `oms_active_shipments` (0 = no limit) |
 | `kibo_host` | `tp3.mozu.com` | Kibo host suffix |
-| `cancel_oms_status` | empty | Keep only this `shipmentStatus` in `oms_active_shipments` |
+| `cancel_oms_status` | `READY` | Keep only this `shipmentStatus` in `oms_active_shipments` (empty = no filter) |
 | `no_picked_reason` | `skip` | What to do with a CANCELLED shipment that has no PICKED event: `skip`, or cancel it as `no-inventory` or `customer` |
 
 A shipment whose PICKED payload carries no `quantity` field at all is skipped and
