@@ -4,6 +4,7 @@ name: Shipments resolver
 #
 #   release-held-exchange : release_held_exchange_shipments.py  (runs daily, see schedule)
 #   fulfill-gxo           : fulfill_gxo_shipments.py            (manual only)
+#   cancel-cancelled      : cancel_cancelled_shipments.py       (manual only)
 #
 # The schedule runs only release-held-exchange. To put another script on the schedule,
 # add it to the `if:` condition of its job below.
@@ -17,14 +18,16 @@ on:
         options:
           - release-held-exchange
           - fulfill-gxo
+          - cancel-cancelled
           - both
+          - all
         default: release-held-exchange
       dry_run:
         description: "Dry run: run every check and read, but perform no write"
         type: boolean
         default: false
       numbers:
-        description: "Optional: comma separated numbers to restrict the run (orderNumbers for release-held-exchange, shipmentOrderNumbers for fulfill-gxo)"
+        description: "Optional: comma separated numbers to restrict the run (orderNumbers for release-held-exchange, shipmentOrderNumbers for the others)"
         type: string
         default: ""
       limit:
@@ -59,6 +62,18 @@ on:
         description: "fulfill-gxo: shipmentStatus to keep in oms_active_shipments (empty = no filter)"
         type: string
         default: "READY"
+      cancel_oms_status:
+        description: "cancel-cancelled: shipmentStatus to keep in oms_active_shipments (empty = no filter)"
+        type: string
+        default: ""
+      no_picked_reason:
+        description: "cancel-cancelled: what to do when a CANCELLED shipment has no PICKED event"
+        type: choice
+        options:
+          - skip
+          - no-inventory
+          - customer
+        default: skip
 
 concurrency:
   group: shipments-resolver
@@ -75,6 +90,7 @@ jobs:
       github.event_name == 'schedule'
       || inputs.scripts == 'release-held-exchange'
       || inputs.scripts == 'both'
+      || inputs.scripts == 'all'
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -133,6 +149,7 @@ jobs:
     if: >-
       inputs.scripts == 'fulfill-gxo'
       || inputs.scripts == 'both'
+      || inputs.scripts == 'all'
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -179,5 +196,60 @@ jobs:
         with:
           name: fulfill-gxo-shipments-results
           path: fulfill_gxo_shipments_results.csv
+          if-no-files-found: warn
+          retention-days: 30
+
+  cancel-cancelled:
+    name: Cancel cancelled shipments in Kibo${{ inputs.dry_run && ' (dry run)' || '' }}
+    # Manual runs only. Add `github.event_name == 'schedule' ||` to put it on the schedule.
+    if: >-
+      inputs.scripts == 'cancel-cancelled'
+      || inputs.scripts == 'all'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run
+        env:
+          BI_BIGQUERY_CREDS: ${{ secrets.BI_BIGQUERY_CREDS }}
+          TIL_BIGQUERY_CREDS: ${{ secrets.TIL_BIGQUERY_CREDS }}
+          KIBO_API_CREDS: ${{ secrets.KIBO_API_CREDS }}
+          INPUT_OMS_STATUS: ${{ inputs.cancel_oms_status }}
+          INPUT_NO_PICKED_REASON: ${{ inputs.no_picked_reason || 'skip' }}
+          INPUT_HOST: ${{ inputs.kibo_host || 'tp3.mozu.com' }}
+          INPUT_LIMIT: ${{ inputs.limit || '0' }}
+          INPUT_NUMBERS: ${{ inputs.numbers }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          DRY_RUN_FLAG=""
+          if [ "$INPUT_DRY_RUN" = "true" ]; then DRY_RUN_FLAG="--dry-run"; fi
+          python cancel_cancelled_shipments.py \
+            $DRY_RUN_FLAG \
+            --oms-status "$INPUT_OMS_STATUS" \
+            --no-picked-reason "$INPUT_NO_PICKED_REASON" \
+            --host "$INPUT_HOST" \
+            --limit "$INPUT_LIMIT" \
+            --shipment-order-numbers "$INPUT_NUMBERS" \
+            --output "cancel_cancelled_shipments_results.csv"
+
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cancel-cancelled-shipments-results
+          path: cancel_cancelled_shipments_results.csv
           if-no-files-found: warn
           retention-days: 30
