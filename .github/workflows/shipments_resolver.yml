@@ -19,7 +19,6 @@ on:
           - release-held-exchange
           - fulfill-gxo
           - cancel-cancelled
-          - both
           - all
         default: release-held-exchange
       dry_run:
@@ -89,7 +88,6 @@ jobs:
     if: >-
       github.event_name == 'schedule'
       || inputs.scripts == 'release-held-exchange'
-      || inputs.scripts == 'both'
       || inputs.scripts == 'all'
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -148,7 +146,6 @@ jobs:
     # Manual runs only. Add `github.event_name == 'schedule' ||` to put it on the schedule.
     if: >-
       inputs.scripts == 'fulfill-gxo'
-      || inputs.scripts == 'both'
       || inputs.scripts == 'all'
     runs-on: ubuntu-latest
     timeout-minutes: 60
