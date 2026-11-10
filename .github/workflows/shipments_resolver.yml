@@ -20,7 +20,7 @@ on:
           - fulfill-gxo
           - cancel-cancelled
           - all
-        default: release-held-exchange
+        default: all
       dry_run:
         description: "Dry run: run every check and read, but perform no write"
         type: boolean
