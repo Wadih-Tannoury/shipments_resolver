@@ -65,7 +65,7 @@ on:
       cancel_oms_status:
         description: "cancel-cancelled: shipmentStatus to keep in oms_active_shipments (empty = no filter)"
         type: string
-        default: ""
+        default: "READY"
       no_picked_reason:
         description: "cancel-cancelled: what to do when a CANCELLED shipment has no PICKED event"
         type: choice
