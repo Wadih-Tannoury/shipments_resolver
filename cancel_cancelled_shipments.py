@@ -39,7 +39,12 @@ Pipeline
        GET https://t{tenantId}.{host}/api/commerce/shipments/{shipmentNumber}
        PUT https://t{tenantId}.{host}/api/commerce/shipments/{shipmentNumber}/canceled
 
-       {"reasonCode": "<reason>", "moreInfo": "<reason>"}
+       {"canceledReason": {"reasonCode": "<reason>", "moreInfo": "<reason>"}}
+
+   The reason has to be nested under canceledReason: Kibo answers 200 to a flat
+   {"reasonCode": ..., "moreInfo": ...} body but ignores it and records its own
+   default reason. After a successful cancellation the shipment is read back and the
+   stored shipmentStatusReason.reasonCode is reported.
 
    The GET is a safety net: a shipment that Kibo already reports as cancelled, closed
    or otherwise terminal is reported as `already_terminal` and left alone.
@@ -344,6 +349,7 @@ class Candidate:
     reason_code: str = ""
     kibo_status_before: str = ""
     kibo_status_after: str = ""
+    kibo_reason_after: str = ""
     action: str = "skipped"
     success: bool = False
     error: str = ""
@@ -637,15 +643,26 @@ class KiboClient:
         max_retries: int, correlation_id: str,
     ) -> Tuple[bool, str, str]:
         url = f"{self.base_url(tenant_id, site_id, shipment_number)}/canceled"
+        # The CancelShipment schema nests the reason under `canceledReason`. A flat
+        # {"reasonCode": ..., "moreInfo": ...} body is accepted with a 200 but silently
+        # ignored, and Kibo records its own default reason ("Canceled") instead.
         response, error = self.request(
             "PUT", url, tenant_id, site_id,
-            json_body={"reasonCode": reason, "moreInfo": reason},
+            json_body={"canceledReason": {"reasonCode": reason, "moreInfo": reason}},
             max_retries=max_retries, correlation_id=correlation_id,
         )
         if response is None:
             return False, error, ""
         ok = 200 <= response.status_code < 300
         return ok, "" if ok else f"HTTP {response.status_code}", excerpt_of(response)
+
+
+def shipment_status_reason(shipment: Dict[str, Any]) -> str:
+    """The reasonCode Kibo actually recorded, from shipmentStatusReason."""
+    node = shipment.get("shipmentStatusReason")
+    if isinstance(node, dict):
+        return clean(node.get("reasonCode"))
+    return ""
 
 
 def shipment_status(shipment: Dict[str, Any]) -> str:
@@ -670,7 +687,7 @@ CSV_FIELDS = [
     "shipment_order_number", "tenant_id", "site_id", "oms_shipment_status",
     "oms_shipment_number", "has_cancelled_event", "has_picked_event", "picked_quantity",
     "logistic_order_number", "kibo_shipment_number", "number_matches_oms", "reason_code",
-    "kibo_status_before", "kibo_status_after",
+    "kibo_status_before", "kibo_status_after", "kibo_reason_after",
     "action", "success", "error", "response_excerpt", "correlation_id",
 ]
 
@@ -709,17 +726,18 @@ def write_job_summary(candidates: List[Candidate], dry_run: bool) -> None:
     ]
     if eligible:
         lines += [
-            "| shipmentOrderNumber | tenant | site | shipmentNumber | picked qty | reason | before | after | action | error |",
-            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+            "| shipmentOrderNumber | tenant | site | shipmentNumber | picked qty | reason | recorded reason | before | after | action | error |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         ]
         for c in eligible[:200]:
             lines.append(
                 f"| {c.shipment_order_number} | {c.tenant_id} | {c.site_id} | {c.kibo_shipment_number} | "
-                f"{c.picked_quantity or '-'} | {c.reason_code or '-'} | {c.kibo_status_before or '-'} | "
+                f"{c.picked_quantity or '-'} | {c.reason_code or '-'} | {c.kibo_reason_after or '-'} | "
+                f"{c.kibo_status_before or '-'} | "
                 f"{c.kibo_status_after or '-'} | {c.action} | {c.error[:120]} |"
             )
         if len(eligible) > 200:
-            lines.append(f"| ... | | | | | | | | | {len(eligible) - 200} more rows in the CSV artifact |")
+            lines.append(f"| ... | | | | | | | | | | {len(eligible) - 200} more rows in the CSV artifact |")
     with open(summary_path, "a", encoding="utf-8") as handle:
         handle.write("\n".join(lines) + "\n")
 
@@ -963,7 +981,18 @@ def main() -> int:
             )
             if isinstance(refreshed, dict):
                 candidate.kibo_status_after = shipment_status(refreshed) or candidate.kibo_status_after
-            log(f"    OK status={candidate.kibo_status_after or 'unknown'}")
+                candidate.kibo_reason_after = shipment_status_reason(refreshed)
+            log(
+                f"    OK status={candidate.kibo_status_after or 'unknown'} "
+                f"reason={candidate.kibo_reason_after or 'unknown'}"
+            )
+            # Kibo answers 200 even when it ignores the reason in the body, so check
+            # what it actually stored rather than trusting the status code.
+            if candidate.kibo_reason_after and candidate.kibo_reason_after != candidate.reason_code:
+                warn(
+                    f"    Kibo recorded reasonCode '{candidate.kibo_reason_after}' "
+                    f"instead of '{candidate.reason_code}'."
+                )
         else:
             warn(f"    {candidate.error}")
             if excerpt:
