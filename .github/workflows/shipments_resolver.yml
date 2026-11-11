@@ -55,6 +55,10 @@ on:
         description: "release-held-exchange: also process events already flagged toBeReprocessed"
         type: boolean
         default: false
+      backfill_shipment_order_number:
+        description: "release-held-exchange: add a missing shipmentOrderNumber from the externalOrderId before releasing the hold"
+        type: boolean
+        default: true
       warehouse:
         description: "fulfill-gxo: warehouse on the SHIPPED event"
         type: string
@@ -135,14 +139,18 @@ jobs:
           INPUT_MAX_ROWS_PER_TX: ${{ inputs.max_rows_per_transaction || '2' }}
           INPUT_DRY_RUN: ${{ inputs.dry_run }}
           INPUT_INCLUDE_MARKED: ${{ inputs.include_already_marked }}
+          INPUT_BACKFILL_SON: ${{ inputs.backfill_shipment_order_number }}
         run: |
           DRY_RUN_FLAG=""
           if [ "$INPUT_DRY_RUN" = "true" ]; then DRY_RUN_FLAG="--dry-run"; fi
           INCLUDE_MARKED_FLAG=""
           if [ "$INPUT_INCLUDE_MARKED" = "true" ]; then INCLUDE_MARKED_FLAG="--include-already-marked"; fi
+          NO_BACKFILL_FLAG=""
+          if [ "$INPUT_BACKFILL_SON" = "false" ]; then NO_BACKFILL_FLAG="--no-backfill-shipment-order-number"; fi
           python release_held_exchange_shipments.py \
             $DRY_RUN_FLAG \
             $INCLUDE_MARKED_FLAG \
+            $NO_BACKFILL_FLAG \
             --host "$INPUT_HOST" \
             --limit "$INPUT_LIMIT" \
             --order-numbers "$INPUT_NUMBERS" \
