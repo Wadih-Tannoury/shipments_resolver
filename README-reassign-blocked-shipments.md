@@ -83,20 +83,32 @@ Viewer** on the `til` dataset is enough.
    {"blockAssignment": false, "fulfillmentLocationCode": "<location>", "isUserAction": true}
    ```
 
-## The location column
+## Columns
 
-The reassign call needs the location **code**, while the query filters on
-`location_name`. The script takes the first of these columns that exists in the table:
+Every column is resolved case-insensitively against the real schema, so `tenantId` and
+`tenant_id` both work, and a column that cannot be found stops the run with the list of
+columns that do exist. Against `prd_fulfillment_monitoring_table` they resolve like this:
 
-```
-location_code, locationCode, fulfillment_location_code, fulfillmentLocationCode,
-location, location_name, locationName
-```
+| Needed | Column used |
+| --- | --- |
+| Kibo shipment number | `oms_shipment_number` |
+| tenant / site | `tenant_id`, `site_id` |
+| fulfillment location code | `location_name` — see below |
+| order number | `order_number` |
+| filters | `fulfillment_status`, `shipment_order_number`, `location_name`, `location_class`, `blocking_reason` |
+| hold flags | `hold_exchange_process`, `hold_process` |
+| sort | `order_submit_date` |
 
-and logs which one it picked. If the monitoring table names it something else, pass
-`--location-column` (the `location_column` workflow input). Every other column is resolved
-the same way, case-insensitively, so `tenantId` and `tenant_id` both work; a column that
-cannot be found stops the run with the list of columns that do exist.
+### The location column
+
+The reassign call needs the location **code**, and this table has no code column — only
+`location_name`, `location_class`, `location_provider` and `available_locations`. The
+script looks for `location_code`, `locationCode`, `fulfillment_location_code`,
+`fulfillmentLocationCode` and `location` first, finds none, falls back to
+`location_name`, logs which column it picked and warns that it is sending a name where
+Kibo wants a code. On these tenants the two are usually the same string. If Kibo rejects
+the location, pass `--location-column` (the `location_column` workflow input) with the
+column that holds the real code.
 
 ## Running it
 
