@@ -5,6 +5,7 @@ name: Shipments resolver
 #   release-held-exchange : release_held_exchange_shipments.py  (runs daily, see schedule)
 #   fulfill-gxo           : fulfill_gxo_shipments.py            (manual only)
 #   cancel-cancelled      : cancel_cancelled_shipments.py       (manual only)
+#   reassign-blocked      : reassign_blocked_shipments.py       (manual only)
 #
 # The schedule runs only release-held-exchange. To put another script on the schedule,
 # add it to the `if:` condition of its job below.
@@ -19,6 +20,7 @@ on:
           - release-held-exchange
           - fulfill-gxo
           - cancel-cancelled
+          - reassign-blocked
           - all
         default: all
       dry_run:
@@ -26,7 +28,7 @@ on:
         type: boolean
         default: false
       numbers:
-        description: "Optional: comma separated numbers to restrict the run (orderNumbers for release-held-exchange, shipmentOrderNumbers for the others)"
+        description: "Optional: comma separated numbers to restrict the run (orderNumbers for release-held-exchange, shipmentNumbers for reassign-blocked, shipmentOrderNumbers for the others)"
         type: string
         default: ""
       limit:
@@ -73,6 +75,10 @@ on:
           - no-inventory
           - customer
         default: skip
+      location_column:
+        description: "reassign-blocked: monitoring table column holding the fulfillment location CODE (empty = auto-detect)"
+        type: string
+        default: ""
 
 concurrency:
   group: shipments-resolver
@@ -248,5 +254,57 @@ jobs:
         with:
           name: cancel-cancelled-shipments-results
           path: cancel_cancelled_shipments_results.csv
+          if-no-files-found: warn
+          retention-days: 30
+
+  reassign-blocked:
+    name: Reassign blocked shipments in Kibo${{ inputs.dry_run && ' (dry run)' || '' }}
+    # Manual runs only. Add `github.event_name == 'schedule' ||` to put it on the schedule.
+    if: >-
+      inputs.scripts == 'reassign-blocked'
+      || inputs.scripts == 'all'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run
+        env:
+          BI_BIGQUERY_CREDS: ${{ secrets.BI_BIGQUERY_CREDS }}
+          KIBO_API_CREDS: ${{ secrets.KIBO_API_CREDS }}
+          INPUT_HOST: ${{ inputs.kibo_host || 'tp3.mozu.com' }}
+          INPUT_LIMIT: ${{ inputs.limit || '0' }}
+          INPUT_NUMBERS: ${{ inputs.numbers }}
+          INPUT_LOCATION_COLUMN: ${{ inputs.location_column }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          DRY_RUN_FLAG=""
+          if [ "$INPUT_DRY_RUN" = "true" ]; then DRY_RUN_FLAG="--dry-run"; fi
+          python reassign_blocked_shipments.py \
+            $DRY_RUN_FLAG \
+            --host "$INPUT_HOST" \
+            --limit "$INPUT_LIMIT" \
+            --shipment-numbers "$INPUT_NUMBERS" \
+            --location-column "$INPUT_LOCATION_COLUMN" \
+            --output "reassign_blocked_shipments_results.csv"
+
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reassign-blocked-shipments-results
+          path: reassign_blocked_shipments_results.csv
           if-no-files-found: warn
           retention-days: 30
