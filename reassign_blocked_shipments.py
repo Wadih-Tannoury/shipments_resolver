@@ -94,18 +94,24 @@ BQ_SCOPES = ["https://www.googleapis.com/auth/bigquery"]
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 # Candidate column names, resolved case-insensitively against the real schema.
+# prd_fulfillment_monitoring_table calls the Kibo shipment number `oms_shipment_number`,
+# the same name oms_active_shipments uses; the rest are fallbacks for other tables.
 SHIPMENT_NUMBER_CANDIDATES = (
-    "shipment_number", "shipmentNumber", "kibo_shipment_number", "kiboShipmentNumber",
-    "shipment_id", "shipmentId",
+    "oms_shipment_number", "omsShipmentNumber", "shipment_number", "shipmentNumber",
+    "kibo_shipment_number", "kiboShipmentNumber", "shipment_id", "shipmentId",
 )
 TENANT_CANDIDATES = ("tenant_id", "tenantId")
 SITE_CANDIDATES = ("site_id", "siteId")
-# The reassign call needs the location CODE. location_name is the last resort, because on
-# some tenants the two are the same value.
+# The reassign call needs the location CODE. prd_fulfillment_monitoring_table has no
+# code column, only location_name, so that is what the run falls back to; on these
+# tenants the name and the code are usually the same string. Override with
+# --location-column if that turns out not to hold.
 LOCATION_CODE_CANDIDATES = (
     "location_code", "locationCode", "fulfillment_location_code", "fulfillmentLocationCode",
     "location", "location_name", "locationName",
 )
+# Resolving to one of these means the run is sending a name where Kibo wants a code.
+LOCATION_NAME_FALLBACKS = {"location_name", "locationname"}
 FULFILLMENT_STATUS_CANDIDATES = ("fulfillment_status", "fulfillmentStatus")
 SHIPMENT_ORDER_NUMBER_CANDIDATES = ("shipment_order_number", "shipmentOrderNumber")
 LOCATION_NAME_CANDIDATES = ("location_name", "locationName")
@@ -301,6 +307,12 @@ def fetch_blocked_shipments(
     else:
         location_col = resolve_column(columns, LOCATION_CODE_CANDIDATES, where)
     log(f"Location code read from column `{location_col}`.")
+    if not location_column and location_col.lower() in LOCATION_NAME_FALLBACKS:
+        warn(
+            f"{BI_TABLE} has no location code column, so `{location_col}` is being sent as "
+            "fulfillmentLocationCode. If Kibo rejects the location, pass --location-column "
+            "with the column that holds the real code."
+        )
 
     filters = [
         f"`{status_col}` = @fulfillment_status",
