@@ -23,7 +23,30 @@ Pipeline
    - tenantId         <- the `x-vol-tenant` field
    - siteId           <- the `x-vol-site` field
 
-3. In Kibo, per shipment number:
+3. In Kibo, per shipment number, read the shipment:
+
+       GET https://t{tenantId}.{host}/api/commerce/shipments/{shipmentNumber}
+
+   When it carries no shipmentOrderNumber, one is derived from its externalOrderId by
+   replacing the 6th character, counting the hyphens, with "A":
+
+       externalOrderId      DG-EU-01630714
+       shipmentOrderNumber  DG-EUA01630714
+
+   and written before the hold is released, so whatever reprocesses the shipment
+   afterwards has it:
+
+       PUT https://t{tenantId}.{host}/api/commerce/shipments/{shipmentNumber}/data?merge=true
+
+       {"shipmentOrderNumber": "DG-EUA01630714"}
+
+   The externalOrderId is taken from the Kibo shipment, falling back to the one in the
+   event payload. A shipment that already has a shipmentOrderNumber is left as it is. If
+   the write fails the hold is NOT released, so the next run retries the pair; if no
+   number can be derived the run says so and releases the hold anyway. The whole step is
+   skipped, GET included, with --no-backfill-shipment-order-number.
+
+4. Release the hold:
 
        PUT https://t{tenantId}.{host}/api/commerce/shipments/{shipmentNumber}/data?merge=true
        x-vol-tenant: {tenantId}
@@ -31,7 +54,7 @@ Pipeline
 
        {"holdExchangeProcess": false}
 
-4. Back in BigQuery, set `toBeReprocessed = TRUE` on the rows returned by step 1,
+5. Back in BigQuery, set `toBeReprocessed = TRUE` on the rows returned by step 1,
    identified by their `transactionId`.
 
 Credentials come from environment variables (GitHub repository secrets):
@@ -39,7 +62,7 @@ Credentials come from environment variables (GitHub repository secrets):
     KIBO_API_CREDS      {"client_id": "...", "client_secret": "..."}
 
 The service account needs BigQuery Job User on the project and Data Editor on the
-`til` dataset, because step 4 is a DML statement.
+`til` dataset, because the last step is a DML statement.
 """
 from __future__ import annotations
 
@@ -78,6 +101,14 @@ DEFAULT_AUTH_URL = "https://home.mozu.com/api/platform/applications/authtickets/
 
 SHIPMENT_DATA_BODY: Dict[str, Any] = {"holdExchangeProcess": False}
 
+# A shipment with no shipmentOrderNumber gets one derived from its externalOrderId, by
+# replacing the 6th character: "DG-EU-01630714" -> "DG-EUA01630714".
+SHIPMENT_ORDER_NUMBER_POSITION = 6
+SHIPMENT_ORDER_NUMBER_CHARACTER = "A"
+# Where a shipmentOrderNumber can already be sitting on the Kibo shipment.
+SHIPMENT_ORDER_NUMBER_KEYS = ("shipmentOrderNumber", "shipment_order_number")
+EXTERNAL_ORDER_ID_KEYS = ("externalOrderId", "external_order_id")
+
 # Retry limit: a transactionId that already appears in more than this many
 # shipment.itemscanceled rows has been retried enough and is left alone.
 DEFAULT_MAX_ROWS_PER_TRANSACTION = 2
@@ -96,7 +127,7 @@ TIMESTAMP_CANDIDATES = (
     "ingestionTimestamp", "ingestion_timestamp", "createdAt", "created_at",
     "creationDate", "creation_date", "loadTimestamp", "load_timestamp",
 )
-# Identifies the rows to flag in step 4.
+# Identifies the rows to flag in the BigQuery update step.
 TRANSACTION_ID_CANDIDATES = ("transactionId", "transaction_id")
 
 TRUE_STRINGS = {"TRUE", "T", "1", "Y", "YES"}
@@ -333,6 +364,49 @@ def shipment_numbers_of(payload: Any) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
+# shipmentOrderNumber
+# ---------------------------------------------------------------------------
+
+def shipment_order_number_from(external_order_id: str) -> Tuple[str, str]:
+    """
+    Build the shipmentOrderNumber out of the externalOrderId.
+
+    The 6th character, counting every character including the hyphens, is replaced by
+    "A": "DG-EU-01630714" becomes "DG-EUA01630714". Returns (value, error).
+    """
+    value = clean(external_order_id)
+    if not value:
+        return "", "no externalOrderId to derive the shipmentOrderNumber from."
+    if len(value) < SHIPMENT_ORDER_NUMBER_POSITION:
+        return "", (
+            f"externalOrderId '{value}' is shorter than {SHIPMENT_ORDER_NUMBER_POSITION} "
+            "characters, so the 6th character cannot be replaced."
+        )
+    index = SHIPMENT_ORDER_NUMBER_POSITION - 1
+    return value[:index] + SHIPMENT_ORDER_NUMBER_CHARACTER + value[index + 1:], ""
+
+
+def value_from_shipment(shipment: Dict[str, Any], keys: Sequence[str]) -> str:
+    """
+    Look a field up on the shipment, at the top level and inside its `data` object.
+
+    Anything written through /data?merge=true lands in `data`, so a shipmentOrderNumber
+    set by an earlier run of this script is found there rather than at the top level.
+    """
+    for key in keys:
+        value = clean(shipment.get(key))
+        if value:
+            return value
+    data = shipment.get("data")
+    if isinstance(data, dict):
+        for key in keys:
+            value = clean(data.get(key))
+            if value:
+                return value
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
 
@@ -347,6 +421,10 @@ class Row:
     shipment_number: str = ""
     event_timestamp: str = ""
     transaction_row_count: int = 0
+    kibo_external_order_id: str = ""
+    shipment_order_number_before: str = ""
+    shipment_order_number_set: str = ""
+    backfill_action: str = ""
     action: str = "skipped"
     success: bool = False
     error: str = ""
@@ -682,18 +760,60 @@ class KiboClient:
             f"/api/commerce/shipments/{quote(shipment_number, safe='')}/data?merge=true"
         )
 
-    def release_exchange_hold(
-        self, tenant_id: str, site_id: str, shipment_number: str, max_retries: int, correlation_id: str
+    def shipment_url(self, tenant_id: str, shipment_number: str) -> str:
+        return (
+            f"https://t{tenant_id}.{self.host}"
+            f"/api/commerce/shipments/{quote(shipment_number, safe='')}"
+        )
+
+    def get_shipment(
+        self, tenant_id: str, site_id: str, shipment_number: str, max_retries: int
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
+        response, error = self.request(
+            "GET", self.shipment_url(tenant_id, shipment_number),
+            tenant_id, site_id, max_retries=max_retries,
+        )
+        if response is None:
+            return None, error
+        if not (200 <= response.status_code < 300):
+            return None, f"HTTP {response.status_code}: {excerpt_of(response, 300)}"
+        try:
+            payload = response.json()
+        except ValueError:
+            return None, "Shipment response was not JSON."
+        return (payload, "") if isinstance(payload, dict) else (None, "Shipment response was not an object.")
+
+    def set_shipment_data(
+        self, tenant_id: str, site_id: str, shipment_number: str, body: Dict[str, Any],
+        max_retries: int, correlation_id: str,
     ) -> Tuple[bool, str, str]:
+        """PUT /data?merge=true, which merges the given fields into the shipment's data."""
         url = self.shipment_data_url(tenant_id, shipment_number)
         response, error = self.request(
             "PUT", url, tenant_id, site_id,
-            json_body=SHIPMENT_DATA_BODY, max_retries=max_retries, correlation_id=correlation_id,
+            json_body=body, max_retries=max_retries, correlation_id=correlation_id,
         )
         if response is None:
             return False, error, ""
         ok = 200 <= response.status_code < 300
         return ok, "" if ok else f"HTTP {response.status_code}", excerpt_of(response)
+
+    def set_shipment_order_number(
+        self, tenant_id: str, site_id: str, shipment_number: str, shipment_order_number: str,
+        max_retries: int, correlation_id: str,
+    ) -> Tuple[bool, str, str]:
+        return self.set_shipment_data(
+            tenant_id, site_id, shipment_number,
+            {"shipmentOrderNumber": shipment_order_number}, max_retries, correlation_id,
+        )
+
+    def release_exchange_hold(
+        self, tenant_id: str, site_id: str, shipment_number: str, max_retries: int, correlation_id: str
+    ) -> Tuple[bool, str, str]:
+        return self.set_shipment_data(
+            tenant_id, site_id, shipment_number,
+            SHIPMENT_DATA_BODY, max_retries, correlation_id,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -703,6 +823,8 @@ class KiboClient:
 CSV_FIELDS = [
     "transaction_id", "order_number", "external_order_id", "tenant_id", "site_id",
     "shipment_number", "event_timestamp", "transaction_row_count",
+    "kibo_external_order_id", "shipment_order_number_before", "shipment_order_number_set",
+    "backfill_action",
     "action", "success", "error", "response_excerpt", "correlation_id",
     "marked_to_be_reprocessed",
 ]
@@ -727,6 +849,8 @@ def write_job_summary(
         return
     eligible = [r for r in rows if r.shipment_number]
     released = [r for r in eligible if r.action == "released" and r.success]
+    added = [r for r in rows if r.backfill_action == "added"]
+    not_derivable = [r for r in rows if r.backfill_action == "not_derivable"]
     over_limit = [r for r in rows if r.action == "retry_limit_reached"]
     failed = [r for r in rows if r.error and r.action != "retry_limit_reached"]
     lines = [
@@ -737,22 +861,26 @@ def write_job_summary(
         f"- Over the retry limit, left alone: **{len(over_limit)}**",
         f"- Shipments to release: **{len(eligible)}**",
         f"- Released: **{len(released)}**",
+        f"- shipmentOrderNumber added: **{len(added)}**"
+        + (f", could not be derived: **{len(not_derivable)}**" if not_derivable else ""),
         f"- With an error: **{len(failed)}**",
         f"- Rows flagged toBeReprocessed: **{updated}**" + (f" (error: {update_error})" if update_error else ""),
         "",
     ]
     if eligible:
         lines += [
-            "| externalOrderId | orderNumber | tenant | site | shipmentNumber | action | error |",
-            "| --- | --- | --- | --- | --- | --- | --- |",
+            "| externalOrderId | orderNumber | tenant | site | shipmentNumber | shipmentOrderNumber | action | error |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
         ]
         for row in eligible[:200]:
             lines.append(
                 f"| {row.external_order_id or '-'} | {row.order_number or '-'} | {row.tenant_id} | "
-                f"{row.site_id} | {row.shipment_number} | {row.action} | {row.error[:120]} |"
+                f"{row.site_id} | {row.shipment_number} | "
+                f"{row.shipment_order_number_set or row.shipment_order_number_before or '-'} | "
+                f"{row.action} | {row.error[:120]} |"
             )
         if len(eligible) > 200:
-            lines.append(f"| ... | | | | | | {len(eligible) - 200} more rows in the CSV artifact |")
+            lines.append(f"| ... | | | | | | | {len(eligible) - 200} more rows in the CSV artifact |")
     with open(summary_path, "a", encoding="utf-8") as handle:
         handle.write("\n".join(lines) + "\n")
 
@@ -773,6 +901,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-rows-per-transaction", type=int, default=DEFAULT_MAX_ROWS_PER_TRANSACTION,
                         help="Retry limit: skip a transactionId that already appears in more than this "
                              f"many {EVENT_TYPE} rows (0 = no limit).")
+    parser.add_argument("--no-backfill-shipment-order-number",
+                        dest="backfill_shipment_order_number", action="store_false",
+                        help="Do not read each shipment and do not add a missing "
+                             "shipmentOrderNumber; only release the exchange hold.")
+    parser.set_defaults(backfill_shipment_order_number=True)
     parser.add_argument("--include-already-marked", action="store_true",
                         help="Also process events whose toBeReprocessed flag is already true.")
     parser.add_argument("--mark-scope", choices=("released", "all", "none"), default="released",
@@ -830,6 +963,11 @@ def main() -> int:
     log(f"Kibo host: {args.host}")
     log(f"Mark scope: {args.mark_scope}")
     log(
+        "Missing shipmentOrderNumber: added from the externalOrderId"
+        if args.backfill_shipment_order_number else
+        "Missing shipmentOrderNumber: left alone (--no-backfill-shipment-order-number)"
+    )
+    log(
         "Retry limit: "
         + (f"at most {args.max_rows_per_transaction} {EVENT_TYPE} row(s) per transactionId"
            if args.max_rows_per_transaction > 0 else "none")
@@ -878,6 +1016,65 @@ def main() -> int:
             f"externalOrderId={row.external_order_id or '-'} "
             f"shipmentNumber={row.shipment_number} (tenant={row.tenant_id}, site={row.site_id})"
         )
+
+        # Read the shipment first: a shipment with no shipmentOrderNumber gets one
+        # before the hold is released, so whatever reprocesses it afterwards has it.
+        if args.backfill_shipment_order_number:
+            shipment, read_error = kibo.get_shipment(
+                row.tenant_id, row.site_id, row.shipment_number, args.max_retries
+            )
+            if shipment is None:
+                row.action = "read_failed"
+                row.error = f"Could not read the shipment: {read_error}"
+                warn(f"    {row.error}")
+                continue
+
+            row.shipment_order_number_before = value_from_shipment(
+                shipment, SHIPMENT_ORDER_NUMBER_KEYS
+            )
+            row.kibo_external_order_id = value_from_shipment(shipment, EXTERNAL_ORDER_ID_KEYS)
+
+            if row.shipment_order_number_before:
+                row.backfill_action = "already_present"
+                log(f"    shipmentOrderNumber={row.shipment_order_number_before}, nothing to add")
+            else:
+                # The Kibo shipment is the better source; the event payload is the fallback.
+                source = row.kibo_external_order_id or row.external_order_id
+                derived, derive_error = shipment_order_number_from(source)
+                if derive_error:
+                    # Not fatal: the hold release is still worth doing, so this is
+                    # reported and the run carries on.
+                    row.backfill_action = "not_derivable"
+                    row.response_excerpt = f"shipmentOrderNumber not added: {derive_error}"
+                    warn(f"    no shipmentOrderNumber and {derive_error}")
+                else:
+                    row.shipment_order_number_set = derived
+                    if args.dry_run:
+                        row.backfill_action = "would_add"
+                        log(f"    DRY RUN PUT {kibo.shipment_data_url(row.tenant_id, row.shipment_number)}")
+                        log(f"              {json.dumps({'shipmentOrderNumber': derived})}")
+                    else:
+                        ok, error, excerpt = kibo.set_shipment_order_number(
+                            row.tenant_id, row.site_id, row.shipment_number, derived,
+                            args.max_retries, row.correlation_id,
+                        )
+                        if not ok:
+                            # Releasing the hold now would send the shipment on without
+                            # the number, so stop here and let the next run retry.
+                            row.backfill_action = "add_failed"
+                            row.action = "backfill_failed"
+                            row.error = f"PUT /data?merge=true (shipmentOrderNumber) failed: {error}"
+                            row.response_excerpt = excerpt
+                            warn(f"    {row.error}")
+                            if excerpt:
+                                warn(f"    response: {excerpt[:400]}")
+                            if args.sleep_between_requests > 0:
+                                time.sleep(args.sleep_between_requests)
+                            continue
+                        row.backfill_action = "added"
+                        log(f"    OK shipmentOrderNumber={derived} (from {source})")
+                        if args.sleep_between_requests > 0:
+                            time.sleep(args.sleep_between_requests)
 
         if args.dry_run:
             row.action = "would_release"
@@ -940,6 +1137,7 @@ def main() -> int:
     log(
         f"Summary: {events_read} events, {len(eligible)} shipments, "
         f"{sum(1 for r in eligible if r.action == 'released' and r.success)} released, "
+        f"{sum(1 for r in rows if r.backfill_action == 'added')} shipmentOrderNumber(s) added, "
         f"{len(failures)} with an error, {len(over_limit)} over the retry limit, "
         f"{updated} rows flagged."
     )
