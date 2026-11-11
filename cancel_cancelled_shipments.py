@@ -4,6 +4,13 @@ Cancel in Kibo the shipments that the warehouse has already cancelled.
 
 Pipeline
 --------
+0. The 6th character of the shipmentOrderNumber gates everything below. Counting every
+   character, the hyphen included, it has to be one of A, B, C or D; otherwise the
+   shipment is left alone, neither cancelled nor reassigned, and reported as
+   `sixth_character_excluded`. "DJ-USA00041696" is in scope, "DJ-USE00041696",
+   "DJ-USF00041696" and "DJ-USI00041696" are not. The set is configurable with
+   --allowed-sixth-characters, and an empty value turns the rule off.
+
 1. Read the active shipments from BigQuery (BI project):
        `tlg-business-intelligence-prd`.til.oms_active_shipments
    keeping only the rows whose shipmentStatus is READY, and taking from them
@@ -37,6 +44,13 @@ Pipeline
 
 4. In Kibo:
        GET https://t{tenantId}.{host}/api/commerce/shipments/{shipmentNumber}
+
+   The GET is a safety net: a shipment that Kibo already reports as cancelled, closed
+   or otherwise terminal is reported as `already_terminal` and left alone. It also
+   supplies the shipment's `channel`, which decides what happens next.
+
+5a. Channel is NOT ecommerce  ->  cancel the shipment:
+
        PUT https://t{tenantId}.{host}/api/commerce/shipments/{shipmentNumber}/canceled
 
        {"canceledReason": {"reasonCode": "<reason>", "moreInfo": "<reason>"}}
@@ -46,8 +60,28 @@ Pipeline
    default reason. After a successful cancellation the shipment is read back and the
    stored shipmentStatusReason.reasonCode is reported.
 
-   The GET is a safety net: a shipment that Kibo already reports as cancelled, closed
-   or otherwise terminal is reported as `already_terminal` and left alone.
+5b. Channel IS ecommerce  ->  auto reassign the shipment instead, so that it goes
+    back through order routing and lands in backorder when no location can fulfil it:
+
+       PUT https://t{tenantId}.{host}/api/commerce/shipments/{shipmentNumber}/reassigned
+
+       {"blockAssignment": false,
+        "isUserAction": true,
+        "reassignedReason": {"reasonCode": "<reason>", "moreInfo": "<reason>"}}
+
+    Kibo's ReassignShipment schema is {blockAssignment, fulfillmentLocationCode,
+    holdBlockAssignment, isUserAction, items, reassignedReason, runId}. Leaving
+    fulfillmentLocationCode OUT is what makes this an AUTO reassign: Kibo's Order Admin
+    offers "Manual" and "Auto Reassign" against this same endpoint, where manual names a
+    target location and auto "sends the shipment back through the order routing process".
+    blockAssignment stays false, so routing may pick the same location again; pass
+    --block-assignment to exclude the location that just cancelled the shipment.
+
+    The channel is read from oms_active_shipments when the table has a channel column,
+    and otherwise from the `channel` field of the Kibo shipment itself. Comparison is
+    case-insensitive and the value is configurable with --ecommerce-channel.
+
+    A shipment Kibo already reports as REASSIGNED or BACKORDER is left alone.
 
 Credentials come from environment variables (GitHub repository secrets):
     BI_BIGQUERY_CREDS   service account JSON for tlg-business-intelligence-prd
@@ -100,11 +134,25 @@ PICKED_EVENT_TYPE = "PICKED"
 REASON_CUSTOMER = "Customer Changed Their Mind"
 REASON_NO_INVENTORY = "No Inventory"
 
+# Shipments on this channel are auto reassigned instead of cancelled.
+DEFAULT_ECOMMERCE_CHANNEL = "ecommerce"
+
+# The 6th character of the shipmentOrderNumber (counting the hyphen, so the 'E' of
+# "DJ-USE00041696") has to be one of these, or the shipment is left alone entirely.
+DEFAULT_ALLOWED_SIXTH_CHARACTERS = "ABCD"
+
+RESOLUTION_CANCEL = "cancel"
+RESOLUTION_REASSIGN = "reassign"
+
 # Kibo statuses that mean "nothing left to cancel".
 TERMINAL_STATUSES = {
     "CANCELED", "CANCELLED", "CLOSED", "COMPLETE", "COMPLETED",
     "FULFILLED", "SHIPPED", "PICKEDUP", "PICKED_UP",
 }
+
+# Statuses that mean the shipment has already left the fulfilment location, so there is
+# nothing to auto reassign: it is already back with routing or already in backorder.
+ALREADY_REASSIGNED_STATUSES = {"REASSIGNED", "BACKORDER", "BACK_ORDER", "BACKORDERED"}
 
 # Candidate column names, resolved case-insensitively against the real schema.
 SHIPMENT_NUMBER_CANDIDATES = ("shipmentOrderNumber", "shipment_order_number")
@@ -114,6 +162,10 @@ OMS_NUMBER_CANDIDATES = (
 PAYLOAD_CANDIDATES = ("requestPayload", "request_payload")
 EVENT_TYPE_CANDIDATES = ("eventType", "event_type")
 OMS_STATUS_CANDIDATES = ("shipmentStatus", "shipment_status", "status")
+CHANNEL_CANDIDATES = (
+    "channel", "channel_name", "channelName", "sales_channel", "salesChannel",
+    "order_channel", "orderChannel",
+)
 QUANTITY_KEYS = ("quantity", "quantityPicked", "pickedQuantity", "qty")
 TIMESTAMP_CANDIDATES = (
     "eventTimestamp", "event_timestamp", "insertTimestamp", "insert_timestamp",
@@ -173,6 +225,42 @@ def chunked(items: Sequence[str], size: int) -> Iterable[List[str]]:
 
 def is_terminal_status(status: str) -> bool:
     return status.upper().replace(" ", "").replace("-", "_") in TERMINAL_STATUSES
+
+
+def is_already_reassigned_status(status: str) -> bool:
+    """True when the shipment is already back with routing or already in backorder."""
+    return status.upper().replace(" ", "").replace("-", "_") in ALREADY_REASSIGNED_STATUSES
+
+
+def sixth_character_of(shipment_order_number: str) -> str:
+    """
+    The 6th character of the shipmentOrderNumber, upper-cased.
+
+    Counting includes every character, the hyphen as well: "DJ-USE00041696" gives "E".
+    Returns "" when the number is shorter than 6 characters.
+    """
+    value = clean(shipment_order_number)
+    return value[5].upper() if len(value) >= 6 else ""
+
+
+def sixth_character_allowed(shipment_order_number: str, allowed: str) -> bool:
+    """
+    Whether the workflow may act on this shipment at all.
+
+    An empty `allowed` disables the rule. A number too short to have a 6th character is
+    never allowed: `"" in "ABCD"` is True in Python, so the emptiness is checked first.
+    """
+    if not allowed:
+        return True
+    character = sixth_character_of(shipment_order_number)
+    return bool(character) and character in allowed
+
+
+def same_channel(value: str, wanted: str) -> bool:
+    """Channel comparison: case-insensitive, and blind to spaces, hyphens and underscores."""
+    def normalize(text: str) -> str:
+        return re.sub(r"[\s_\-]+", "", clean(text)).upper()
+    return bool(wanted) and normalize(value) == normalize(wanted)
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +428,12 @@ class Candidate:
     site_id: str
     oms_shipment_status: str = ""
     oms_shipment_number: str = ""
+    sixth_character: str = ""
+    oms_channel: str = ""
+    kibo_channel: str = ""
+    channel: str = ""
+    channel_source: str = ""
+    resolution: str = ""
     has_cancelled_event: bool = False
     has_picked_event: bool = False
     picked_quantity: str = ""
@@ -389,6 +483,12 @@ def fetch_active_shipments(
             f"{BI_TABLE} has no shipment number column ({list(OMS_NUMBER_CANDIDATES)}); "
             "the logisticOrderNumber cannot be checked against it."
         )
+    channel_col = resolve_column(columns, CHANNEL_CANDIDATES, where, required=False)
+    if not channel_col:
+        warn(
+            f"{BI_TABLE} has no channel column ({list(CHANNEL_CANDIDATES)}); "
+            "the channel will be read from the Kibo shipment instead."
+        )
 
     filters = [f"`{number_col}` IS NOT NULL", f"TRIM(CAST(`{number_col}` AS STRING)) != ''"]
     params: List[bigquery.ScalarQueryParameter | bigquery.ArrayQueryParameter] = []
@@ -401,13 +501,15 @@ def fetch_active_shipments(
 
     status_select = f"CAST(`{status_col}` AS STRING)" if status_col else "CAST(NULL AS STRING)"
     oms_number_select = f"CAST(`{oms_number_col}` AS STRING)" if oms_number_col else "CAST(NULL AS STRING)"
+    channel_select = f"CAST(`{channel_col}` AS STRING)" if channel_col else "CAST(NULL AS STRING)"
     sql = f"""
         SELECT DISTINCT
             CAST(`{number_col}` AS STRING) AS shipment_order_number,
             CAST(`{tenant_col}` AS STRING) AS tenant_id,
             CAST(`{site_col}`   AS STRING) AS site_id,
             {status_select} AS oms_shipment_status,
-            {oms_number_select} AS oms_shipment_number
+            {oms_number_select} AS oms_shipment_number,
+            {channel_select} AS oms_channel
         FROM `{BI_PROJECT}.{BI_DATASET}.{BI_TABLE}`
         WHERE {' AND '.join(filters)}
         ORDER BY shipment_order_number
@@ -437,6 +539,7 @@ def fetch_active_shipments(
             site_id=site,
             oms_shipment_status=clean(row["oms_shipment_status"]),
             oms_shipment_number=clean(row["oms_shipment_number"]),
+            oms_channel=clean(row["oms_channel"]),
         ))
     return candidates
 
@@ -656,6 +759,44 @@ class KiboClient:
         ok = 200 <= response.status_code < 300
         return ok, "" if ok else f"HTTP {response.status_code}", excerpt_of(response)
 
+    def auto_reassign(
+        self, tenant_id: str, site_id: str, shipment_number: str, reason: str,
+        block_assignment: bool, max_retries: int, correlation_id: str,
+    ) -> Tuple[bool, str, str]:
+        """
+        Send the shipment back through order routing (Kibo's "Auto Reassign").
+
+        The ReassignShipment schema accepts blockAssignment, fulfillmentLocationCode,
+        holdBlockAssignment, isUserAction, items, reassignedReason and runId. Omitting
+        fulfillmentLocationCode is what separates an auto reassign from a manual one:
+        with no target location, Kibo re-runs order routing, and the shipment drops into
+        backorder when no location can fulfil it. blockAssignment keeps routing from
+        choosing the location that just cancelled, which would otherwise loop.
+        """
+        url = f"{self.base_url(tenant_id, site_id, shipment_number)}/reassigned"
+        body: Dict[str, Any] = {
+            "blockAssignment": block_assignment,
+            "isUserAction": True,
+            "reassignedReason": {"reasonCode": reason, "moreInfo": reason},
+        }
+        response, error = self.request(
+            "PUT", url, tenant_id, site_id,
+            json_body=body, max_retries=max_retries, correlation_id=correlation_id,
+        )
+        if response is None:
+            return False, error, ""
+        ok = 200 <= response.status_code < 300
+        return ok, "" if ok else f"HTTP {response.status_code}", excerpt_of(response)
+
+
+def shipment_channel(shipment: Dict[str, Any]) -> str:
+    """The shipment's channel as Kibo reports it."""
+    for key in ("channel", "channelName", "salesChannel"):
+        value = clean(shipment.get(key))
+        if value:
+            return value
+    return ""
+
 
 def shipment_status_reason(shipment: Dict[str, Any]) -> str:
     """The reasonCode Kibo actually recorded, from shipmentStatusReason."""
@@ -685,7 +826,8 @@ def shipment_status(shipment: Dict[str, Any]) -> str:
 
 CSV_FIELDS = [
     "shipment_order_number", "tenant_id", "site_id", "oms_shipment_status",
-    "oms_shipment_number", "has_cancelled_event", "has_picked_event", "picked_quantity",
+    "oms_shipment_number", "sixth_character", "oms_channel", "kibo_channel", "channel", "channel_source",
+    "resolution", "has_cancelled_event", "has_picked_event", "picked_quantity",
     "logistic_order_number", "kibo_shipment_number", "number_matches_oms", "reason_code",
     "kibo_status_before", "kibo_status_after", "kibo_reason_after",
     "action", "success", "error", "response_excerpt", "correlation_id",
@@ -707,10 +849,13 @@ def write_job_summary(candidates: List[Candidate], dry_run: bool) -> None:
         return
     eligible = [c for c in candidates if c.kibo_shipment_number]
     cancelled = [c for c in candidates if c.action == "canceled" and c.success]
-    already = [c for c in candidates if c.action == "already_terminal"]
+    reassigned = [c for c in candidates if c.action == "reassigned" and c.success]
+    already = [c for c in candidates if c.action in ("already_terminal", "already_reassigned")]
+    excluded = [c for c in candidates if c.action == "sixth_character_excluded"]
     failed = [c for c in candidates if c.error]
     customer = [c for c in eligible if c.reason_code == REASON_CUSTOMER]
     no_inventory = [c for c in eligible if c.reason_code == REASON_NO_INVENTORY]
+    backordered = [c for c in reassigned if is_already_reassigned_status(c.kibo_status_after)]
     lines = [
         "## Cancel cancelled shipments",
         "",
@@ -720,24 +865,28 @@ def write_job_summary(candidates: List[Candidate], dry_run: bool) -> None:
         f"- Reason *{REASON_CUSTOMER}*: **{len(customer)}**",
         f"- Reason *{REASON_NO_INVENTORY}*: **{len(no_inventory)}**",
         f"- Cancelled: **{len(cancelled)}**",
-        f"- Already in a terminal status: **{len(already)}**",
+        f"- Auto reassigned (ecommerce): **{len(reassigned)}**"
+        + (f", of which now backorder/reassigned: **{len(backordered)}**" if reassigned else ""),
+        f"- Already in a terminal or reassigned status: **{len(already)}**",
+        f"- Left alone, 6th character not allowed: **{len(excluded)}**",
         f"- With an error: **{len(failed)}**",
         "",
     ]
     if eligible:
         lines += [
-            "| shipmentOrderNumber | tenant | site | shipmentNumber | picked qty | reason | recorded reason | before | after | action | error |",
-            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+            "| shipmentOrderNumber | tenant | site | shipmentNumber | channel | resolution | picked qty | reason | recorded reason | before | after | action | error |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         ]
         for c in eligible[:200]:
             lines.append(
                 f"| {c.shipment_order_number} | {c.tenant_id} | {c.site_id} | {c.kibo_shipment_number} | "
+                f"{c.channel or '-'} | {c.resolution or '-'} | "
                 f"{c.picked_quantity or '-'} | {c.reason_code or '-'} | {c.kibo_reason_after or '-'} | "
                 f"{c.kibo_status_before or '-'} | "
                 f"{c.kibo_status_after or '-'} | {c.action} | {c.error[:120]} |"
             )
         if len(eligible) > 200:
-            lines.append(f"| ... | | | | | | | | | | {len(eligible) - 200} more rows in the CSV artifact |")
+            lines.append(f"| ... | | | | | | | | | | | | {len(eligible) - 200} more rows in the CSV artifact |")
     with open(summary_path, "a", encoding="utf-8") as handle:
         handle.write("\n".join(lines) + "\n")
 
@@ -755,6 +904,19 @@ def parse_args() -> argparse.Namespace:
                              "Pass an empty string to disable the filter.")
     parser.add_argument("--no-picked-reason", default="skip", choices=("skip", "no-inventory", "customer"),
                         help="What to do when a CANCELLED shipment has no PICKED event at all.")
+    parser.add_argument("--ecommerce-channel", default=DEFAULT_ECOMMERCE_CHANNEL,
+                        help="Shipments on this channel are auto reassigned instead of cancelled, so they "
+                             "go back through order routing and into backorder. Compared case-insensitively. "
+                             "Pass an empty string to cancel every shipment regardless of channel.")
+    parser.add_argument("--block-assignment", dest="block_assignment", action="store_true",
+                        help="Auto reassign with blockAssignment = true, so routing cannot hand the "
+                             "shipment straight back to the location that cancelled it. "
+                             "Off by default: blockAssignment = false.")
+    parser.set_defaults(block_assignment=False)
+    parser.add_argument("--allowed-sixth-characters", default=DEFAULT_ALLOWED_SIXTH_CHARACTERS,
+                        help="Only act on a shipment whose shipmentOrderNumber has one of these as its "
+                             "6th character (the 'E' of DJ-USE00041696). Case-insensitive. "
+                             "Pass an empty string to act on every shipment.")
     parser.add_argument("--host", default=DEFAULT_HOST, help="Kibo host suffix.")
     parser.add_argument("--auth-url", default=DEFAULT_AUTH_URL, help="Kibo OAuth URL.")
     parser.add_argument("--limit", type=int, default=0, help="Limit the number of active shipments (0 = no limit).")
@@ -772,6 +934,11 @@ def parse_args() -> argparse.Namespace:
     if args.max_retries < 1:
         parser.error("--max-retries must be at least 1.")
     args.oms_status = args.oms_status.strip()
+    args.ecommerce_channel = args.ecommerce_channel.strip()
+    # Accept "ABCD", "A,B,C,D" and "a b c d" alike.
+    args.allowed_sixth_characters = "".join(
+        sorted({c for c in args.allowed_sixth_characters.upper() if c.isalnum()})
+    )
     args.host = re.sub(r"^https?://", "", args.host.strip()).split("/", 1)[0].rstrip(".")
     return args
 
@@ -792,6 +959,19 @@ def main() -> int:
     log(f"Mode: {'DRY RUN' if args.dry_run else 'LIVE'}")
     log(f"oms_active_shipments status filter: {args.oms_status or '(none)'}")
     log(f"Shipments with a CANCELLED event but no PICKED event: {args.no_picked_reason}")
+    log(
+        f"6th character of shipmentOrderNumber must be one of "
+        f"{args.allowed_sixth_characters}"
+        if args.allowed_sixth_characters else
+        "No 6th character rule: every shipmentOrderNumber is in scope."
+    )
+    if args.ecommerce_channel:
+        log(
+            f"Channel '{args.ecommerce_channel}': auto reassign instead of cancel "
+            f"(blockAssignment={'true' if args.block_assignment else 'false'})"
+        )
+    else:
+        log("No ecommerce channel set: every shipment is cancelled.")
     log(f"Kibo host: {args.host}")
 
     kibo_credentials = load_json_env("KIBO_API_CREDS")
@@ -819,7 +999,17 @@ def main() -> int:
         write_job_summary(candidates, args.dry_run)
         return 0
 
-    numbers = [c.shipment_order_number for c in candidates]
+    # Excluded shipments are not queried either: the 6th-character rule decides before
+    # anything else, so there is no reason to read their events.
+    numbers = [
+        c.shipment_order_number for c in candidates
+        if sixth_character_allowed(c.shipment_order_number, args.allowed_sixth_characters)
+    ]
+    excluded_count = len(candidates) - len(numbers)
+    if excluded_count:
+        log(
+            f"Left alone, 6th character not in {args.allowed_sixth_characters}: {excluded_count}"
+        )
     events_by_number = fetch_status_events(wlfs_client, numbers, args.batch_size)
     with_cancelled = sum(1 for e in events_by_number.values() if e.has_cancelled)
     log(f"Shipment order numbers with a CANCELLED event: {with_cancelled}")
@@ -830,6 +1020,22 @@ def main() -> int:
     rows: List[Candidate] = []
     eligible: List[Candidate] = []
     for candidate in candidates:
+        # The 6th character of the shipmentOrderNumber gates the whole workflow: a
+        # shipment outside the allowed set is left alone, neither cancelled nor
+        # reassigned. Checked first so no Kibo call is made for it at all.
+        candidate.sixth_character = sixth_character_of(candidate.shipment_order_number)
+        if not sixth_character_allowed(candidate.shipment_order_number, args.allowed_sixth_characters):
+            candidate.action = "sixth_character_excluded"
+            candidate.error = (
+                f"6th character '{candidate.sixth_character}' is not one of "
+                f"{args.allowed_sixth_characters}."
+                if candidate.sixth_character else
+                f"shipmentOrderNumber '{candidate.shipment_order_number}' is shorter than "
+                "6 characters, so the 6th character cannot be checked."
+            )
+            rows.append(candidate)
+            continue
+
         events = events_by_number.get(candidate.shipment_order_number, StatusEvents())
         candidate.has_cancelled_event = events.has_cancelled
         candidate.has_picked_event = events.has_picked
@@ -952,6 +1158,27 @@ def main() -> int:
 
         candidate.kibo_status_before = shipment_status(shipment)
         candidate.kibo_status_after = candidate.kibo_status_before
+        candidate.kibo_channel = shipment_channel(shipment)
+
+        # oms_active_shipments wins when it carries a channel; otherwise the Kibo
+        # shipment itself is the source. Both are kept in the CSV.
+        if candidate.oms_channel:
+            candidate.channel = candidate.oms_channel
+            candidate.channel_source = BI_TABLE
+        elif candidate.kibo_channel:
+            candidate.channel = candidate.kibo_channel
+            candidate.channel_source = "kibo"
+        else:
+            candidate.channel = ""
+            candidate.channel_source = "unknown"
+
+        candidate.resolution = (
+            RESOLUTION_REASSIGN
+            if same_channel(candidate.channel, args.ecommerce_channel)
+            else RESOLUTION_CANCEL
+        )
+        log(f"    channel={candidate.channel or 'unknown'} ({candidate.channel_source}) "
+            f"-> {candidate.resolution}")
 
         if is_terminal_status(candidate.kibo_status_before):
             candidate.action = "already_terminal"
@@ -959,20 +1186,42 @@ def main() -> int:
             log(f"    already {candidate.kibo_status_before}, nothing to do.")
             continue
 
-        if args.dry_run:
-            candidate.action = "would_cancel"
+        if (candidate.resolution == RESOLUTION_REASSIGN
+                and is_already_reassigned_status(candidate.kibo_status_before)):
+            candidate.action = "already_reassigned"
             candidate.success = True
-            candidate.response_excerpt = "DRY RUN - the canceled endpoint was not called"
+            log(f"    already {candidate.kibo_status_before}, nothing to reassign.")
+            continue
+
+        if args.dry_run:
+            candidate.action = (
+                "would_reassign" if candidate.resolution == RESOLUTION_REASSIGN else "would_cancel"
+            )
+            candidate.success = True
+            candidate.response_excerpt = (
+                "DRY RUN - the reassigned endpoint was not called"
+                if candidate.resolution == RESOLUTION_REASSIGN
+                else "DRY RUN - the canceled endpoint was not called"
+            )
             log(f"    DRY RUN status={candidate.kibo_status_before or 'unknown'} reason={candidate.reason_code}")
             continue
 
-        ok, error, excerpt = kibo.mark_canceled(
-            candidate.tenant_id, candidate.site_id, candidate.kibo_shipment_number,
-            candidate.reason_code, args.max_retries, candidate.correlation_id,
-        )
-        candidate.action = "canceled" if ok else "cancel_failed"
+        if candidate.resolution == RESOLUTION_REASSIGN:
+            ok, error, excerpt = kibo.auto_reassign(
+                candidate.tenant_id, candidate.site_id, candidate.kibo_shipment_number,
+                candidate.reason_code, args.block_assignment, args.max_retries,
+                candidate.correlation_id,
+            )
+            candidate.action = "reassigned" if ok else "reassign_failed"
+            candidate.error = "" if ok else f"PUT /reassigned failed: {error}"
+        else:
+            ok, error, excerpt = kibo.mark_canceled(
+                candidate.tenant_id, candidate.site_id, candidate.kibo_shipment_number,
+                candidate.reason_code, args.max_retries, candidate.correlation_id,
+            )
+            candidate.action = "canceled" if ok else "cancel_failed"
+            candidate.error = "" if ok else f"PUT /canceled failed: {error}"
         candidate.success = ok
-        candidate.error = "" if ok else f"PUT /canceled failed: {error}"
         candidate.response_excerpt = excerpt
 
         if ok:
@@ -993,6 +1242,10 @@ def main() -> int:
                     f"    Kibo recorded reasonCode '{candidate.kibo_reason_after}' "
                     f"instead of '{candidate.reason_code}'."
                 )
+            # An auto reassign that found no location leaves the shipment in BACKORDER,
+            # which is the intended landing spot; anything else is worth seeing.
+            if candidate.resolution == RESOLUTION_REASSIGN and candidate.kibo_status_after:
+                log(f"    reassigned, shipment is now {candidate.kibo_status_after}")
         else:
             warn(f"    {candidate.error}")
             if excerpt:
@@ -1009,7 +1262,9 @@ def main() -> int:
     log(
         f"Summary: {len(candidates)} active shipment order numbers, {len(eligible)} eligible shipments, "
         f"{sum(1 for c in eligible if c.action == 'canceled' and c.success)} cancelled, "
-        f"{len(failures)} failed."
+        f"{sum(1 for c in eligible if c.action == 'reassigned' and c.success)} auto reassigned, "
+        f"{sum(1 for c in rows if c.action == 'sixth_character_excluded')} left alone on the "
+        f"6th character rule, {len(failures)} failed."
     )
     return 0 if not failures else 2
 
