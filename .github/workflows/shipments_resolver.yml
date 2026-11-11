@@ -75,6 +75,18 @@ on:
           - no-inventory
           - customer
         default: skip
+      ecommerce_channel:
+        description: "cancel-cancelled: shipments on this channel are auto reassigned instead of cancelled (empty = cancel everything)"
+        type: string
+        default: "ecommerce"
+      block_assignment:
+        description: "cancel-cancelled: on auto reassign, block the location that cancelled the shipment"
+        type: boolean
+        default: false
+      allowed_sixth_characters:
+        description: "cancel-cancelled: only act when the 6th character of the shipmentOrderNumber is one of these (empty = no rule)"
+        type: string
+        default: "ABCD"
       location_column:
         description: "reassign-blocked: monitoring table column holding the fulfillment location CODE (empty = auto-detect)"
         type: string
@@ -232,6 +244,9 @@ jobs:
           KIBO_API_CREDS: ${{ secrets.KIBO_API_CREDS }}
           INPUT_OMS_STATUS: ${{ inputs.cancel_oms_status }}
           INPUT_NO_PICKED_REASON: ${{ inputs.no_picked_reason || 'skip' }}
+          INPUT_ECOMMERCE_CHANNEL: ${{ inputs.ecommerce_channel }}
+          INPUT_BLOCK_ASSIGNMENT: ${{ inputs.block_assignment }}
+          INPUT_ALLOWED_SIXTH: ${{ inputs.allowed_sixth_characters }}
           INPUT_HOST: ${{ inputs.kibo_host || 'tp3.mozu.com' }}
           INPUT_LIMIT: ${{ inputs.limit || '0' }}
           INPUT_NUMBERS: ${{ inputs.numbers }}
@@ -239,10 +254,15 @@ jobs:
         run: |
           DRY_RUN_FLAG=""
           if [ "$INPUT_DRY_RUN" = "true" ]; then DRY_RUN_FLAG="--dry-run"; fi
+          BLOCK_FLAG=""
+          if [ "$INPUT_BLOCK_ASSIGNMENT" = "true" ]; then BLOCK_FLAG="--block-assignment"; fi
           python cancel_cancelled_shipments.py \
             $DRY_RUN_FLAG \
+            $BLOCK_FLAG \
             --oms-status "$INPUT_OMS_STATUS" \
             --no-picked-reason "$INPUT_NO_PICKED_REASON" \
+            --ecommerce-channel "$INPUT_ECOMMERCE_CHANNEL" \
+            --allowed-sixth-characters "$INPUT_ALLOWED_SIXTH" \
             --host "$INPUT_HOST" \
             --limit "$INPUT_LIMIT" \
             --shipment-order-numbers "$INPUT_NUMBERS" \
