@@ -71,7 +71,45 @@ The service account needs BigQuery **Job User** on the project and **Data Editor
    payload has no `entityId`, no tenant or no site is reported as `skipped` with the
    missing fields named, and is never flagged for reprocessing.
 
-4. Per shipment number:
+4. Reads each shipment and adds a missing `shipmentOrderNumber`:
+
+   ```
+   GET https://t{tenantId}.tp3.mozu.com/api/commerce/shipments/{shipmentNumber}
+   ```
+
+   When the shipment carries no `shipmentOrderNumber`, one is derived from its
+   `externalOrderId` by replacing the **6th character**, counting the hyphens, with `A`:
+
+   | `externalOrderId` | `shipmentOrderNumber` |
+   | --- | --- |
+   | `DG-EU-01630714` | `DG-EUA01630714` |
+
+   and written back before the hold is released, so whatever reprocesses the shipment
+   afterwards has it:
+
+   ```
+   PUT https://t{tenantId}.tp3.mozu.com/api/commerce/shipments/{shipmentNumber}/data?merge=true
+
+   {"shipmentOrderNumber": "DG-EUA01630714"}
+   ```
+
+   The `externalOrderId` is taken from the Kibo shipment, falling back to the one in the
+   event payload. The `shipmentOrderNumber` is looked for both at the top level of the
+   shipment and inside its `data` object, since anything written through
+   `/data?merge=true` lands in `data`.
+
+   | Situation | `backfill_action` | Hold released? |
+   | --- | --- | --- |
+   | already has a `shipmentOrderNumber` | `already_present` | yes |
+   | added successfully | `added` | yes |
+   | `externalOrderId` missing or under 6 characters | `not_derivable` | yes, with a warning |
+   | the write failed | `add_failed` | **no** — the next run retries the pair |
+
+   Set the `backfill_shipment_order_number` input to `false` (or pass
+   `--no-backfill-shipment-order-number`) to skip the whole step, `GET` included, and
+   only release holds.
+
+5. Releases the hold:
 
    ```
    PUT https://t{tenantId}.tp3.mozu.com/api/commerce/shipments/{shipmentNumber}/data?merge=true
@@ -83,7 +121,7 @@ The service account needs BigQuery **Job User** on the project and **Data Editor
 
    Note the host carries only the tenant; the site travels in the header.
 
-5. Sets `toBeReprocessed = TRUE` on the events from step 1, identified by the
+6. Sets `toBeReprocessed = TRUE` on the events from step 1, identified by the
    `transactionId` column:
 
    ```sql
@@ -97,7 +135,9 @@ The service account needs BigQuery **Job User** on the project and **Data Editor
    The last two predicates matter: a `transactionId` is shared by every row of the same
    transaction, including other event types, retries and request/response pairs, so
    without them the update reaches well beyond the rows the query returned. The flag is
-   written as `TRUE`, `1` or `'true'` depending on the column's declared type.
+   written as `TRUE`, `1` or `'true'` depending on the column's declared type. A
+   shipment whose `shipmentOrderNumber` write failed is never flagged, because its hold
+   was not released either.
 
    The run logs how many rows were flagged against how many transactionIds, and warns when
    the two differ. More rows than transactionIds means a transaction carries several held
@@ -121,13 +161,14 @@ triggers. For a manual run: Actions → **Shipments resolver** → Run workflow,
 | Input | Default | Notes |
 | --- | --- | --- |
 | `scripts` | `release-held-exchange` | Set to `both` to also run the GXO script |
-| `dry_run` | `false` | Reads and reports everything, calls neither Kibo nor the update |
+| `dry_run` | `false` | Reads each shipment and reports everything, but writes nothing to Kibo and runs no update |
 | `numbers` | empty | Comma separated `orderNumber`s to restrict the run |
 | `limit` | `0` | Cap on the number of events (0 = no limit) |
 | `kibo_host` | `tp3.mozu.com` | Kibo host suffix |
-| `mark_scope` | `released` | `released`, `all` or `none` (see step 5) |
+| `mark_scope` | `released` | `released`, `all` or `none` (see step 6) |
 | `max_rows_per_transaction` | `2` | Retry limit per `transactionId` (0 = no limit) |
 | `include_already_marked` | `false` | Also process events already flagged |
+| `backfill_shipment_order_number` | `true` | Add a missing `shipmentOrderNumber` from the `externalOrderId` before releasing the hold (see step 4) |
 
 The `warehouse` and `oms_status` inputs belong to the GXO job and are ignored here.
 
@@ -147,9 +188,13 @@ python release_held_exchange_shipments.py --dry-run
 
 Every run uploads `release-held-exchange-shipments-results`, a CSV with one row per
 shipment: the transactionId, order number, externalOrderId, tenant, site, shipment number,
-event timestamp, the attempt count behind the retry limit, the action taken, any error,
-the Kibo response excerpt, the correlation id sent as `x-vol-correlation`, and whether the
-event was flagged. A condensed table also goes to the job summary. The job exits with code
+event timestamp, the attempt count behind the retry limit, the `externalOrderId` Kibo
+itself reports, the `shipmentOrderNumber` found before the run and the one written
+(`kibo_external_order_id`, `shipment_order_number_before`, `shipment_order_number_set`,
+`backfill_action`), the action taken, any error, the Kibo response excerpt, the
+correlation id sent as `x-vol-correlation`, and whether the event was flagged. The
+action is `released`, `would_release`, `backfill_failed`, `read_failed`,
+`release_failed`, `retry_limit_reached` or `skipped`. A condensed table also goes to the job summary. The job exits with code
 2 when any shipment failed or the update could not be applied; reaching the retry limit is
 not counted as a failure, so a permanently stuck order does not turn every daily run red.
 
