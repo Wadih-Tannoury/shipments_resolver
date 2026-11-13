@@ -83,6 +83,34 @@ Pipeline
 
     A shipment Kibo already reports as REASSIGNED or BACKORDER is left alone.
 
+5c. Channel IS ecommerce, but the same products of the same order have already been
+    cancelled too many times  ->  cancel instead of reassigning.
+
+    Reassigning only helps while some other location might still fulfil the order. Once
+    the same products have come back CANCELLED under more than 3 distinct
+    shipmentOrderNumber values of the same order number, routing has run out of places
+    to try and another reassign would only bounce the shipment again, so the active
+    READY shipment is cancelled with the reason of step 2 instead.
+
+    - prd_shipmentStatus carries no order number, so the shipments of one order are
+      found by wildcarding the 6th character of the shipmentOrderNumber, the generation
+      letter that the rule in step 0 already keys on:
+
+          SELECT * FROM `tlg-wlfs-prd`.til.prd_shipmentStatus
+          WHERE shipmentOrderNumber LIKE 'DJ-US%ST0000124550'
+
+      so DJ-USAST0000124550, DJ-USBST0000124550 and DJ-USCST0000124550 are one order.
+
+    - the count is over distinct shipmentOrderNumber values of that order that
+      carry a CANCELLED event in prd_shipmentStatus, the shipment being processed
+      included, and is NOT limited to the shipments still in oms_active_shipments
+    - "the same products" is decided on the product codes found anywhere in the
+      CANCELLED requestPayload (upc, sku, productCode, ...). --product-match exact,
+      the default, counts only the shipmentOrderNumbers whose product set is identical;
+      overlap counts those sharing at least one product; any ignores products entirely
+    - the threshold is --max-cancelled-order-shipments (default 3, so the 4th fires),
+      and --no-repeat-cancel turns the whole rule off
+
 Credentials come from environment variables (GitHub repository secrets):
     BI_BIGQUERY_CREDS   service account JSON for tlg-business-intelligence-prd
     TIL_BIGQUERY_CREDS  service account JSON for tlg-wlfs-prd
@@ -136,6 +164,33 @@ REASON_NO_INVENTORY = "No Inventory"
 
 # Shipments on this channel are auto reassigned instead of cancelled.
 DEFAULT_ECOMMERCE_CHANNEL = "ecommerce"
+
+# An ecommerce shipment is cancelled rather than reassigned once the same products of
+# the same order carry a CANCELLED event under more than this many distinct
+# shipmentOrderNumber values (the shipment being processed included).
+DEFAULT_MAX_CANCELLED_ORDER_SHIPMENTS = 3
+
+# How the product sets of two CANCELLED events are compared.
+PRODUCT_MATCH_EXACT = "exact"
+PRODUCT_MATCH_OVERLAP = "overlap"
+PRODUCT_MATCH_ANY = "any"
+DEFAULT_PRODUCT_MATCH = PRODUCT_MATCH_EXACT
+
+# Product identifiers looked for anywhere in a CANCELLED requestPayload.
+DEFAULT_PRODUCT_KEYS = (
+    "upc", "sku", "productCode", "variationProductCode", "itemCode", "partNumber",
+    "productId", "barcode", "ean", "styleCode",
+)
+
+# prd_shipmentStatus carries no order number, so the shipments of one order are found by
+# wildcarding the 6th character of the shipmentOrderNumber, the generation letter:
+#
+#     SELECT * FROM `tlg-wlfs-prd`.til.prd_shipmentStatus
+#     WHERE shipmentOrderNumber LIKE 'DJ-US%ST0000124550'
+#
+# The pattern is what identifies the order throughout this script.
+ORDER_PATTERN_WILDCARD = "%"
+ORDER_PATTERN_POSITION = 6
 
 # The 6th character of the shipmentOrderNumber (counting the hyphen, so the 'E' of
 # "DJ-USE00041696") has to be one of these, or the shipment is left alone entirely.
@@ -254,6 +309,83 @@ def sixth_character_allowed(shipment_order_number: str, allowed: str) -> bool:
         return True
     character = sixth_character_of(shipment_order_number)
     return bool(character) and character in allowed
+
+
+def order_pattern_of(shipment_order_number: str) -> str:
+    """
+    The LIKE pattern matching every shipmentOrderNumber of the same order.
+
+    prd_shipmentStatus has no order number column, so the order is identified by the
+    shipmentOrderNumber with its 6th character — the generation letter, the A/B/C/D the
+    sixth-character rule already keys on — replaced by the SQL wildcard:
+
+        DJ-USAST0000124550  ->  DJ-US%ST0000124550
+
+    which is the hand check
+
+        SELECT * FROM `tlg-wlfs-prd`.til.prd_shipmentStatus
+        WHERE shipmentOrderNumber LIKE 'DJ-US%ST0000124550'
+
+    Returns "" when the number is shorter than 6 characters, or when it already carries
+    a % or _ of its own, since those would widen the pattern in ways nobody intended.
+    """
+    value = clean(shipment_order_number)
+    if len(value) < ORDER_PATTERN_POSITION or "%" in value or "_" in value:
+        return ""
+    cut = ORDER_PATTERN_POSITION - 1
+    return value[:cut] + ORDER_PATTERN_WILDCARD + value[cut + 1:]
+
+
+def matches_order_pattern(shipment_order_number: str, pattern: str) -> bool:
+    """
+    The Python twin of `shipmentOrderNumber LIKE pattern`.
+
+    BigQuery returns the rows of several patterns in one go, so each row is handed back
+    to the pattern (or patterns) it belongs to here. % matches any run of characters and
+    _ a single one, as in SQL.
+    """
+    if not pattern:
+        return False
+    regex = "".join(
+        ".*" if part == "%" else "." if part == "_" else re.escape(part)
+        for part in pattern
+    )
+    return re.fullmatch(regex, clean(shipment_order_number)) is not None
+
+
+def products_of(payload: Dict[str, Any], product_keys: Sequence[str]) -> frozenset[str]:
+    """
+    Every product identifier carried by a payload, anywhere in the nesting.
+
+    All the configured keys are collected into one set rather than stopping at the first
+    one that exists, so two payloads that name their products differently still produce
+    comparable sets. Values are upper-cased and stripped.
+    """
+    products: set[str] = set()
+    for key in product_keys:
+        for value in iter_values(payload, key):
+            text = clean(value).upper()
+            if text:
+                products.add(text)
+    return frozenset(products)
+
+
+def products_match(left: frozenset[str], right: frozenset[str], mode: str) -> bool:
+    """Whether two CANCELLED events concern the same products."""
+    if mode == PRODUCT_MATCH_ANY:
+        return True
+    if not left or not right:
+        return False
+    if mode == PRODUCT_MATCH_OVERLAP:
+        return bool(left & right)
+    return left == right
+
+
+def format_products(products: Iterable[str], limit: int = 8) -> str:
+    items = sorted(products)
+    if len(items) > limit:
+        return ", ".join(items[:limit]) + f", +{len(items) - limit} more"
+    return ", ".join(items)
 
 
 def same_channel(value: str, wanted: str) -> bool:
@@ -433,7 +565,13 @@ class Candidate:
     kibo_channel: str = ""
     channel: str = ""
     channel_source: str = ""
+    order_pattern: str = ""
+    cancelled_products: str = ""
+    cancelled_order_shipments: str = ""
+    cancelled_order_shipment_numbers: str = ""
+    repeat_cancel: str = ""
     resolution: str = ""
+    resolution_source: str = ""
     has_cancelled_event: bool = False
     has_picked_event: bool = False
     picked_quantity: str = ""
@@ -459,6 +597,8 @@ class StatusEvents:
     picked_payload: Optional[Dict[str, Any]] = None
     # Every distinct logisticOrderNumber carried by the events, newest first.
     logistic_numbers: List[str] = field(default_factory=list)
+    # The products the CANCELLED events name, for the repeat-cancellation rule of 5c.
+    cancelled_products: frozenset = frozenset()
 
 
 # ---------------------------------------------------------------------------
@@ -545,7 +685,8 @@ def fetch_active_shipments(
 
 
 def fetch_status_events(
-    client: bigquery.Client, numbers: Sequence[str], batch_size: int
+    client: bigquery.Client, numbers: Sequence[str], batch_size: int,
+    product_keys: Sequence[str],
 ) -> Dict[str, StatusEvents]:
     """
     Return {shipmentOrderNumber: StatusEvents} for the CANCELLED and PICKED events.
@@ -604,10 +745,103 @@ def fetch_status_events(
                 continue
             if event_type == PICKED_EVENT_TYPE and events.picked_payload is None:
                 events.picked_payload = payload
+            if event_type in CANCELLED_EVENT_TYPES:
+                # Several CANCELLED events can describe the same shipment in pieces, so
+                # the products of all of them make up one set.
+                events.cancelled_products |= products_of(payload, product_keys)
             logistic = logistic_order_number_of(payload)
             if logistic and logistic not in events.logistic_numbers:
                 events.logistic_numbers.append(logistic)
     return found
+
+
+def fetch_cancelled_order_shipments(
+    client: bigquery.Client, order_patterns: Sequence[str], batch_size: int,
+    product_keys: Sequence[str], pattern_batch_size: int,
+) -> Dict[str, Dict[str, frozenset]]:
+    """
+    Return {orderPattern: {shipmentOrderNumber: products}} for the CANCELLED events.
+
+    prd_shipmentStatus has no order number column, so the shipments of one order are
+    found the way the hand check finds them:
+
+        SELECT * FROM `tlg-wlfs-prd`.til.prd_shipmentStatus
+        WHERE shipmentOrderNumber LIKE 'DJ-US%ST0000124550'
+
+    One query carries many patterns at once, each row matching at least one of them, and
+    the rows are handed back to their pattern in Python. Unlike fetch_status_events this
+    is not restricted to the shipment order numbers of oms_active_shipments, so it also
+    sees the earlier generations of the order that are long gone from the active table:
+    those are exactly the ones the repeat-cancellation rule has to count.
+
+    LIKE with a leading-literal pattern cannot use a BigQuery index, so every row of the
+    scanned partitions is tested; patterns are therefore sent in smaller batches than the
+    plain IN UNNEST queries, and the whole step is skipped with --no-repeat-cancel.
+    """
+    where = f"`{WLFS_PROJECT}.{WLFS_DATASET}.{SHIPMENT_STATUS_TABLE}`"
+    columns = table_columns(client, WLFS_PROJECT, WLFS_DATASET, SHIPMENT_STATUS_TABLE)
+    number_col = resolve_column(columns, SHIPMENT_NUMBER_CANDIDATES, where)
+    payload_col = resolve_column(columns, PAYLOAD_CANDIDATES, where)
+    event_col = resolve_column(columns, EVENT_TYPE_CANDIDATES, where)
+
+    sql = f"""
+        SELECT
+            CAST(`{number_col}` AS STRING) AS shipment_order_number,
+            CAST(`{payload_col}` AS STRING) AS payload
+        FROM {where}
+        WHERE UPPER(CAST(`{event_col}` AS STRING)) IN UNNEST(@event_types)
+          AND EXISTS (
+              SELECT 1 FROM UNNEST(@order_patterns) AS order_pattern
+              WHERE CAST(`{number_col}` AS STRING) LIKE order_pattern
+          )
+    """
+
+    found: Dict[str, Dict[str, frozenset]] = {pattern: {} for pattern in order_patterns}
+    for batch in chunked(order_patterns, max(1, pattern_batch_size)):
+        job = client.query(
+            sql,
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ArrayQueryParameter("order_patterns", "STRING", batch),
+                bigquery.ArrayQueryParameter(
+                    "event_types", "STRING", list(CANCELLED_EVENT_TYPES)
+                ),
+            ]),
+        )
+        for row in job.result():
+            number = clean(row["shipment_order_number"])
+            if not number:
+                continue
+            payload = parse_payload(row["payload"])
+            products = products_of(payload, product_keys) if payload else frozenset()
+            # A row can satisfy more than one pattern of the batch; it counts for each.
+            for pattern in batch:
+                if matches_order_pattern(number, pattern):
+                    per_order = found.setdefault(pattern, {})
+                    per_order[number] = per_order.get(number, frozenset()) | products
+    return found
+
+
+def repeat_cancellation(
+    candidate: Candidate,
+    own_products: frozenset,
+    cancelled_by_order: Dict[str, Dict[str, frozenset]],
+    product_match: str,
+) -> Tuple[int, List[str]]:
+    """
+    How many shipmentOrderNumbers of this order were CANCELLED with the same products.
+
+    The shipment being processed counts itself, since it too carries a CANCELLED event.
+    Returns (count, the shipment order numbers counted).
+    """
+    siblings = cancelled_by_order.get(candidate.order_pattern, {})
+    matched = [
+        number for number, products in siblings.items()
+        if number == candidate.shipment_order_number
+        or products_match(own_products, products, product_match)
+    ]
+    if candidate.shipment_order_number not in matched:
+        matched.append(candidate.shipment_order_number)
+    return len(matched), sorted(matched)
 
 
 # ---------------------------------------------------------------------------
@@ -827,7 +1061,9 @@ def shipment_status(shipment: Dict[str, Any]) -> str:
 CSV_FIELDS = [
     "shipment_order_number", "tenant_id", "site_id", "oms_shipment_status",
     "oms_shipment_number", "sixth_character", "oms_channel", "kibo_channel", "channel", "channel_source",
-    "resolution", "has_cancelled_event", "has_picked_event", "picked_quantity",
+    "order_pattern", "cancelled_products", "cancelled_order_shipments",
+    "cancelled_order_shipment_numbers", "repeat_cancel",
+    "resolution", "resolution_source", "has_cancelled_event", "has_picked_event", "picked_quantity",
     "logistic_order_number", "kibo_shipment_number", "number_matches_oms", "reason_code",
     "kibo_status_before", "kibo_status_after", "kibo_reason_after",
     "action", "success", "error", "response_excerpt", "correlation_id",
@@ -856,6 +1092,7 @@ def write_job_summary(candidates: List[Candidate], dry_run: bool) -> None:
     customer = [c for c in eligible if c.reason_code == REASON_CUSTOMER]
     no_inventory = [c for c in eligible if c.reason_code == REASON_NO_INVENTORY]
     backordered = [c for c in reassigned if is_already_reassigned_status(c.kibo_status_after)]
+    repeat = [c for c in eligible if c.repeat_cancel == "yes"]
     lines = [
         "## Cancel cancelled shipments",
         "",
@@ -867,6 +1104,8 @@ def write_job_summary(candidates: List[Candidate], dry_run: bool) -> None:
         f"- Cancelled: **{len(cancelled)}**",
         f"- Auto reassigned (ecommerce): **{len(reassigned)}**"
         + (f", of which now backorder/reassigned: **{len(backordered)}**" if reassigned else ""),
+        f"- Ecommerce cancelled instead of reassigned (same products cancelled too "
+        f"often on the order): **{len(repeat)}**",
         f"- Already in a terminal or reassigned status: **{len(already)}**",
         f"- Left alone, 6th character not allowed: **{len(excluded)}**",
         f"- With an error: **{len(failed)}**",
@@ -874,19 +1113,21 @@ def write_job_summary(candidates: List[Candidate], dry_run: bool) -> None:
     ]
     if eligible:
         lines += [
-            "| shipmentOrderNumber | tenant | site | shipmentNumber | channel | resolution | picked qty | reason | recorded reason | before | after | action | error |",
-            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+            "| shipmentOrderNumber | tenant | site | shipmentNumber | channel | orderNumber | cancelled on order | resolution | picked qty | reason | recorded reason | before | after | action | error |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         ]
         for c in eligible[:200]:
             lines.append(
                 f"| {c.shipment_order_number} | {c.tenant_id} | {c.site_id} | {c.kibo_shipment_number} | "
-                f"{c.channel or '-'} | {c.resolution or '-'} | "
+                f"{c.channel or '-'} | {c.order_pattern or '-'} | "
+                f"{c.cancelled_order_shipments or '-'} | "
+                f"{c.resolution or '-'}{' (repeat)' if c.repeat_cancel == 'yes' else ''} | "
                 f"{c.picked_quantity or '-'} | {c.reason_code or '-'} | {c.kibo_reason_after or '-'} | "
                 f"{c.kibo_status_before or '-'} | "
                 f"{c.kibo_status_after or '-'} | {c.action} | {c.error[:120]} |"
             )
         if len(eligible) > 200:
-            lines.append(f"| ... | | | | | | | | | | | | {len(eligible) - 200} more rows in the CSV artifact |")
+            lines.append(f"| ... | | | | | | | | | | | | | | {len(eligible) - 200} more rows in the CSV artifact |")
     with open(summary_path, "a", encoding="utf-8") as handle:
         handle.write("\n".join(lines) + "\n")
 
@@ -913,6 +1154,28 @@ def parse_args() -> argparse.Namespace:
                              "shipment straight back to the location that cancelled it. "
                              "Off by default: blockAssignment = false.")
     parser.set_defaults(block_assignment=False)
+    parser.add_argument("--max-cancelled-order-shipments", type=int,
+                        default=DEFAULT_MAX_CANCELLED_ORDER_SHIPMENTS,
+                        help="For ecommerce shipments only: when the same products of the same order "
+                             "number already carry a CANCELLED event under more than this many distinct "
+                             "shipmentOrderNumber values (this shipment included), cancel the READY "
+                             "shipment instead of auto reassigning it. Default 3, so the 4th fires.")
+    parser.add_argument("--product-match", default=DEFAULT_PRODUCT_MATCH,
+                        choices=(PRODUCT_MATCH_EXACT, PRODUCT_MATCH_OVERLAP, PRODUCT_MATCH_ANY),
+                        help="How 'the same products' is decided when counting the cancelled "
+                             "shipmentOrderNumbers of an order: 'exact' needs identical product sets, "
+                             "'overlap' at least one product in common, 'any' ignores products.")
+    parser.add_argument("--product-keys", default=",".join(DEFAULT_PRODUCT_KEYS),
+                        help="Comma separated payload keys read as product identifiers, looked for "
+                             "anywhere in the CANCELLED requestPayload.")
+    parser.add_argument("--pattern-batch-size", type=int, default=50,
+                        help="Order LIKE patterns per BigQuery query when counting the cancelled "
+                             "shipmentOrderNumbers of an order. Smaller than --batch-size because "
+                             "LIKE cannot use an index and every pattern widens the scan.")
+    parser.add_argument("--no-repeat-cancel", dest="repeat_cancel", action="store_false",
+                        help="Turn the repeat-cancellation rule off: ecommerce shipments are always "
+                             "auto reassigned, however often the order has been cancelled before.")
+    parser.set_defaults(repeat_cancel=True)
     parser.add_argument("--allowed-sixth-characters", default=DEFAULT_ALLOWED_SIXTH_CHARACTERS,
                         help="Only act on a shipment whose shipmentOrderNumber has one of these as its "
                              "6th character (the 'E' of DJ-USE00041696). Case-insensitive. "
@@ -933,8 +1196,17 @@ def parse_args() -> argparse.Namespace:
         parser.error("--batch-size must be at least 1.")
     if args.max_retries < 1:
         parser.error("--max-retries must be at least 1.")
+    if args.pattern_batch_size < 1:
+        parser.error("--pattern-batch-size must be at least 1.")
+    if args.max_cancelled_order_shipments < 1:
+        parser.error("--max-cancelled-order-shipments must be at least 1.")
     args.oms_status = args.oms_status.strip()
     args.ecommerce_channel = args.ecommerce_channel.strip()
+    args.product_keys = tuple(
+        key for key in re.split(r"[,\s;]+", args.product_keys.strip()) if key
+    )
+    if args.repeat_cancel and not args.product_keys and args.product_match != PRODUCT_MATCH_ANY:
+        parser.error("--product-keys cannot be empty unless --product-match is 'any'.")
     # Accept "ABCD", "A,B,C,D" and "a b c d" alike.
     args.allowed_sixth_characters = "".join(
         sorted({c for c in args.allowed_sixth_characters.upper() if c.isalnum()})
@@ -970,6 +1242,15 @@ def main() -> int:
             f"Channel '{args.ecommerce_channel}': auto reassign instead of cancel "
             f"(blockAssignment={'true' if args.block_assignment else 'false'})"
         )
+        if args.repeat_cancel:
+            log(
+                f"  except when more than {args.max_cancelled_order_shipments} "
+                f"shipmentOrderNumber values of the same order carry a CANCELLED "
+                f"event for the same products (--product-match {args.product_match}): "
+                "those are cancelled instead."
+            )
+        else:
+            log("  repeat-cancellation rule off: ecommerce is always auto reassigned.")
     else:
         log("No ecommerce channel set: every shipment is cancelled.")
     log(f"Kibo host: {args.host}")
@@ -1010,7 +1291,9 @@ def main() -> int:
         log(
             f"Left alone, 6th character not in {args.allowed_sixth_characters}: {excluded_count}"
         )
-    events_by_number = fetch_status_events(wlfs_client, numbers, args.batch_size)
+    events_by_number = fetch_status_events(
+        wlfs_client, numbers, args.batch_size, args.product_keys
+    )
     with_cancelled = sum(1 for e in events_by_number.values() if e.has_cancelled)
     log(f"Shipment order numbers with a CANCELLED event: {with_cancelled}")
 
@@ -1019,6 +1302,9 @@ def main() -> int:
 
     rows: List[Candidate] = []
     eligible: List[Candidate] = []
+    # The products each shipment order number was CANCELLED with, kept aside because
+    # `Candidate` only carries their printable form.
+    products_by_number: Dict[str, frozenset] = {}
     for candidate in candidates:
         # The 6th character of the shipmentOrderNumber gates the whole workflow: a
         # shipment outside the allowed set is left alone, neither cancelled nor
@@ -1039,6 +1325,13 @@ def main() -> int:
         events = events_by_number.get(candidate.shipment_order_number, StatusEvents())
         candidate.has_cancelled_event = events.has_cancelled
         candidate.has_picked_event = events.has_picked
+        # Both feed the repeat-cancellation rule. The order is identified by the
+        # shipmentOrderNumber with its generation letter wildcarded, since
+        # prd_shipmentStatus carries no order number: DJ-USAST0000124550 is looked up as
+        # LIKE 'DJ-US%ST0000124550'.
+        candidate.order_pattern = order_pattern_of(candidate.shipment_order_number)
+        candidate.cancelled_products = format_products(events.cancelled_products)
+        products_by_number[candidate.shipment_order_number] = events.cancelled_products
 
         if not events.has_cancelled:
             candidate.action = "skipped"
@@ -1138,6 +1431,34 @@ def main() -> int:
         f"reason '{REASON_NO_INVENTORY}': {sum(1 for c in eligible if c.reason_code == REASON_NO_INVENTORY)}"
     )
 
+    # The repeat-cancellation rule needs every CANCELLED shipmentOrderNumber of each
+    # order, including the generations that have already dropped out of
+    # oms_active_shipments, so prd_shipmentStatus is read once more with
+    # `shipmentOrderNumber LIKE 'DJ-US%ST0000124550'` per order.
+    cancelled_by_order: Dict[str, Dict[str, frozenset]] = {}
+    if args.repeat_cancel and args.ecommerce_channel and eligible:
+        order_patterns = sorted({c.order_pattern for c in eligible if c.order_pattern})
+        if order_patterns:
+            log(
+                f"Orders checked for repeat cancellations: {len(order_patterns)} "
+                f"(LIKE patterns, {args.pattern_batch_size} per query, "
+                f"e.g. {order_patterns[0]})"
+            )
+            cancelled_by_order = fetch_cancelled_order_shipments(
+                wlfs_client, order_patterns, args.batch_size, args.product_keys,
+                args.pattern_batch_size,
+            )
+            log(
+                "Orders with a CANCELLED event: "
+                f"{sum(1 for v in cancelled_by_order.values() if v)}"
+            )
+        missing = sum(1 for c in eligible if not c.order_pattern)
+        if missing:
+            warn(
+                f"{missing} eligible shipment(s) have no usable order pattern, so the "
+                "repeat-cancellation rule cannot be applied to them."
+            )
+
     for index, candidate in enumerate(eligible, start=1):
         candidate.correlation_id = uuid.uuid4().hex
         log(
@@ -1172,13 +1493,50 @@ def main() -> int:
             candidate.channel = ""
             candidate.channel_source = "unknown"
 
-        candidate.resolution = (
-            RESOLUTION_REASSIGN
-            if same_channel(candidate.channel, args.ecommerce_channel)
-            else RESOLUTION_CANCEL
-        )
+        is_ecommerce = same_channel(candidate.channel, args.ecommerce_channel)
+        candidate.resolution = RESOLUTION_REASSIGN if is_ecommerce else RESOLUTION_CANCEL
+        candidate.resolution_source = "channel"
+
+        # An ecommerce shipment is reassigned only while routing still has somewhere to
+        # send it. Once the same products of this order have come back CANCELLED under
+        # more than --max-cancelled-order-shipments shipmentOrderNumbers, reassigning
+        # again would just bounce it once more, so the READY shipment is cancelled.
+        if is_ecommerce and args.repeat_cancel:
+            if not candidate.order_pattern:
+                candidate.repeat_cancel = "unknown"
+                candidate.resolution_source = (
+                    "channel (no order pattern: shipmentOrderNumber too short)"
+                )
+            else:
+                own_products = products_by_number.get(
+                    candidate.shipment_order_number, frozenset()
+                )
+                if not own_products and args.product_match != PRODUCT_MATCH_ANY:
+                    candidate.repeat_cancel = "unknown"
+                    candidate.resolution_source = "channel (no products in the CANCELLED payload)"
+                else:
+                    count, numbers_counted = repeat_cancellation(
+                        candidate, own_products, cancelled_by_order, args.product_match
+                    )
+                    candidate.cancelled_order_shipments = str(count)
+                    candidate.cancelled_order_shipment_numbers = ", ".join(numbers_counted)
+                    if count > args.max_cancelled_order_shipments:
+                        candidate.repeat_cancel = "yes"
+                        candidate.resolution = RESOLUTION_CANCEL
+                        candidate.resolution_source = (
+                            f"{count} cancelled shipmentOrderNumbers on order "
+                            f"{candidate.order_pattern}"
+                        )
+                        log(
+                            f"    order {candidate.order_pattern}: the same products were "
+                            f"cancelled on {count} shipmentOrderNumbers "
+                            f"({', '.join(numbers_counted)}) -> cancel instead of reassign"
+                        )
+                    else:
+                        candidate.repeat_cancel = "no"
+
         log(f"    channel={candidate.channel or 'unknown'} ({candidate.channel_source}) "
-            f"-> {candidate.resolution}")
+            f"-> {candidate.resolution} ({candidate.resolution_source})")
 
         if is_terminal_status(candidate.kibo_status_before):
             candidate.action = "already_terminal"
@@ -1261,7 +1619,9 @@ def main() -> int:
     log(f"Results written to {output_path}")
     log(
         f"Summary: {len(candidates)} active shipment order numbers, {len(eligible)} eligible shipments, "
-        f"{sum(1 for c in eligible if c.action == 'canceled' and c.success)} cancelled, "
+        f"{sum(1 for c in eligible if c.action == 'canceled' and c.success)} cancelled "
+        f"(of which {sum(1 for c in eligible if c.repeat_cancel == 'yes')} ecommerce on the "
+        f"repeat-cancellation rule), "
         f"{sum(1 for c in eligible if c.action == 'reassigned' and c.success)} auto reassigned, "
         f"{sum(1 for c in rows if c.action == 'sixth_character_excluded')} left alone on the "
         f"6th character rule, {len(failures)} failed."
