@@ -91,6 +91,22 @@ on:
         description: "cancel-cancelled: only act when the 6th character of the shipmentOrderNumber is one of these (empty = no rule)"
         type: string
         default: "ABCD"
+      repeat_cancel:
+        description: "cancel-cancelled: cancel an ecommerce shipment instead of reassigning it when the same products of the order keep coming back cancelled"
+        type: boolean
+        default: true
+      max_cancelled_order_shipments:
+        description: "cancel-cancelled: cancelled shipmentOrderNumbers of one order tolerated before cancelling instead of reassigning"
+        type: string
+        default: "3"
+      product_match:
+        description: "cancel-cancelled: how 'the same products' is decided when counting the cancelled shipmentOrderNumbers of an order"
+        type: choice
+        options:
+          - exact
+          - overlap
+          - any
+        default: exact
       location_column:
         description: "reassign-blocked: monitoring table column holding the fulfillment location CODE (empty = auto-detect)"
         type: string
@@ -255,6 +271,9 @@ jobs:
           INPUT_ECOMMERCE_CHANNEL: ${{ inputs.ecommerce_channel }}
           INPUT_BLOCK_ASSIGNMENT: ${{ inputs.block_assignment }}
           INPUT_ALLOWED_SIXTH: ${{ inputs.allowed_sixth_characters }}
+          INPUT_REPEAT_CANCEL: ${{ inputs.repeat_cancel }}
+          INPUT_MAX_CANCELLED_ORDER_SHIPMENTS: ${{ inputs.max_cancelled_order_shipments || '3' }}
+          INPUT_PRODUCT_MATCH: ${{ inputs.product_match || 'exact' }}
           INPUT_HOST: ${{ inputs.kibo_host || 'tp3.mozu.com' }}
           INPUT_LIMIT: ${{ inputs.limit || '0' }}
           INPUT_NUMBERS: ${{ inputs.numbers }}
@@ -264,12 +283,17 @@ jobs:
           if [ "$INPUT_DRY_RUN" = "true" ]; then DRY_RUN_FLAG="--dry-run"; fi
           BLOCK_FLAG=""
           if [ "$INPUT_BLOCK_ASSIGNMENT" = "true" ]; then BLOCK_FLAG="--block-assignment"; fi
+          REPEAT_FLAG=""
+          if [ "$INPUT_REPEAT_CANCEL" = "false" ]; then REPEAT_FLAG="--no-repeat-cancel"; fi
           python cancel_cancelled_shipments.py \
             $DRY_RUN_FLAG \
             $BLOCK_FLAG \
+            $REPEAT_FLAG \
             --oms-status "$INPUT_OMS_STATUS" \
             --no-picked-reason "$INPUT_NO_PICKED_REASON" \
             --ecommerce-channel "$INPUT_ECOMMERCE_CHANNEL" \
+            --max-cancelled-order-shipments "$INPUT_MAX_CANCELLED_ORDER_SHIPMENTS" \
+            --product-match "$INPUT_PRODUCT_MATCH" \
             --allowed-sixth-characters "$INPUT_ALLOWED_SIXTH" \
             --host "$INPUT_HOST" \
             --limit "$INPUT_LIMIT" \
