@@ -3,7 +3,10 @@
 Manually triggered GitHub Actions workflow that resolves in Kibo the shipments the
 warehouse has already cancelled, with the reason code derived from the PICKED quantity.
 Shipments on the **ecommerce** channel are auto reassigned instead of cancelled, so they
-go back through order routing and land in backorder; everything else is cancelled.
+go back through order routing and land in backorder; everything else is cancelled. An
+ecommerce shipment whose order — every `shipmentOrderNumber` matching
+`LIKE 'DJ-US%ST0000124550'` — has already had the same products cancelled under more
+than three of them is cancelled too, because routing has run out of places to try.
 
 ## Repository layout
 
@@ -107,10 +110,68 @@ and `abcd` all work); set it empty to turn the rule off.
    A shipment Kibo already reports as REASSIGNED or BACKORDER is reported as
    `already_reassigned` and left alone.
 
+   **Channel is ecommerce but the order keeps coming back cancelled — cancel anyway:**
+   see the next section.
+
    After a successful call the shipment is read back and the stored
    `shipmentStatusReason.reasonCode` is written to the `kibo_reason_after` column; if
    it differs from the reason that was sent, the run logs a warning. Every call carries
    `x-vol-tenant` and `x-vol-site`.
+
+## When an ecommerce shipment is cancelled instead of reassigned
+
+Reassigning only helps while some other location might still fulfil the order. Once the
+same products have come back `CANCELLED` under **more than 3** distinct
+`shipmentOrderNumber` values of the same order number, routing has tried everywhere it
+can, and another reassign would only bounce the shipment around again. At that point the
+active `READY` shipment is cancelled instead, with the same reason code step 4 picked.
+
+**The order.** `prd_shipmentStatus` has no order number column, so the shipments of one
+order are found the way you would find them by hand: the `shipmentOrderNumber` with its
+6th character — the generation letter the scope rule already keys on — replaced by the
+SQL wildcard.
+
+```sql
+SELECT * FROM `tlg-wlfs-prd`.til.prd_shipmentStatus
+WHERE shipmentOrderNumber LIKE 'DJ-US%ST0000124550'
+```
+
+| shipmentOrderNumber | LIKE pattern |
+| --- | --- |
+| `DJ-USAST0000124550` | `DJ-US%ST0000124550` |
+| `DJ-USBST0000124550` | `DJ-US%ST0000124550` |
+| `DJ-USCST0000124550` | `DJ-US%ST0000124550` |
+| `DJ-USDST0000124550` | `DJ-US%ST0000124550` |
+
+The pattern is in the CSV as `order_pattern`. A `shipmentOrderNumber` shorter than 6
+characters, or one already containing a `%` or `_`, gets no pattern: it is reported and
+reassigned as before rather than matched against something wider than intended.
+
+**The count.** `prd_shipmentStatus` is read a second time on those patterns, not on the
+shipment order numbers of `oms_active_shipments`, so the earlier generations that have
+long since left the active table are counted too — they are exactly the ones that
+matter. One query carries 50 patterns (`--pattern-batch-size`), since `LIKE` cannot use
+an index and every pattern widens the scan; `repeat_cancel = false` skips the query
+altogether. The shipment being processed counts itself, since it carries a `CANCELLED`
+event of its own, so `A`, `B`, `C` and `D` all cancelled with the same products gives 4,
+which is more than 3, and `D` is cancelled rather than reassigned. Generations outside
+the `ABCD` scope rule still count towards the total — they are cancellations of the same
+order — they just never become the shipment being acted on.
+
+**The products.** They are the product codes found anywhere in the `CANCELLED`
+`requestPayload` — `upc`, `sku`, `productCode`, `variationProductCode`, `itemCode`,
+`partNumber`, `productId`, `barcode`, `ean`, `styleCode` — compared case-insensitively.
+
+| `product_match` | counts a shipmentOrderNumber when |
+| --- | --- |
+| `exact` (default) | its product set is identical |
+| `overlap` | it shares at least one product |
+| `any` | always, products are ignored |
+
+A shipment whose `CANCELLED` payload names no products at all is reported with
+`repeat_cancel = unknown` and auto reassigned as before, rather than cancelled on a
+guess; so is one with no usable pattern. Set `max_cancelled_order_shipments` to change the
+threshold, or `repeat_cancel` to `false` to turn the rule off and always reassign.
 
 ## Why that body is an auto reassign
 
@@ -178,6 +239,9 @@ once, skips the check, and marks those rows `unchecked`.
 | `ecommerce_channel` | `ecommerce` | Shipments on this channel are auto reassigned instead of cancelled (empty = cancel everything) |
 | `block_assignment` | `false` | On auto reassign, block the location that cancelled the shipment |
 | `allowed_sixth_characters` | `ABCD` | Only act when the 6th character of the `shipmentOrderNumber` is one of these (empty = no rule) |
+| `repeat_cancel` | `true` | Cancel an ecommerce shipment instead of reassigning it when the same products of the order have been cancelled too often |
+| `max_cancelled_order_shipments` | `3` | How many cancelled `shipmentOrderNumber`s of one order are tolerated before cancelling instead of reassigning |
+| `product_match` | `exact` | How "the same products" is decided: `exact`, `overlap` or `any` |
 
 A shipment whose PICKED payload carries no `quantity` field at all is skipped and
 reported, rather than treated as zero.
@@ -187,7 +251,9 @@ reported, rather than treated as zero.
 The job uploads `cancel_cancelled_shipments_results.csv` as an artifact (30 days) and
 writes a summary table to the run page. One row per Kibo shipment, with
 `oms_shipment_number`, `sixth_character`, `oms_channel`, `kibo_channel`, `channel`, `channel_source`,
-`resolution` (`cancel` or `reassign`), `has_cancelled_event`, `has_picked_event`,
+`order_pattern`, `cancelled_products`, `cancelled_order_shipments`,
+`cancelled_order_shipment_numbers`, `repeat_cancel` (`yes`, `no` or `unknown`),
+`resolution` (`cancel` or `reassign`), `resolution_source`, `has_cancelled_event`, `has_picked_event`,
 `picked_quantity`, `reason_code`, `logistic_order_number`, `kibo_shipment_number`,
 `number_matches_oms`, the Kibo status before and after, `kibo_reason_after`, the
 action (`canceled`, `reassigned`, `would_cancel`, `would_reassign`, `already_terminal`,
