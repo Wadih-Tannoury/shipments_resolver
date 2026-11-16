@@ -99,14 +99,18 @@ on:
         description: "cancel-cancelled: send the CANCEL event to GXO before cancelling in Kibo"
         type: boolean
         default: true
-      cancel_ecommerce:
-        description: "cancel-cancelled: allow ecommerce shipments to be cancelled (off = never cancel ecommerce, always reassign)"
+      ecommerce_mode:
+        description: "cancel-cancelled: what to do with ecommerce shipments"
+        type: choice
+        options:
+          - "none (leave untouched)"
+          - "reassign only"
+          - "reassign + cancel on repeats"
+        default: "none (leave untouched)"
+      require_event_target:
+        description: "cancel-cancelled: wait for GXO's own CANCELLED event before cancelling in Kibo (off = cancel in Kibo as soon as GXO accepts)"
         type: boolean
         default: false
-      require_event_target:
-        description: "cancel-cancelled: cancel in Kibo only when the latest CANCELLED event names the READY GXO shipment (otherwise warehouse only)"
-        type: boolean
-        default: true
       repeat_cancel:
         description: "cancel-cancelled: cancel an ecommerce shipment instead of reassigning it when the same products of the order keep coming back cancelled"
         type: boolean
@@ -298,7 +302,7 @@ jobs:
           INPUT_RESOLVE_CANCEL_TARGET: ${{ inputs.resolve_cancel_target }}
           INPUT_CANCEL_EXTRA_ARGS: ${{ inputs.cancel_extra_args }}
           INPUT_WAREHOUSE_CANCEL: ${{ inputs.warehouse_cancel }}
-          INPUT_CANCEL_ECOMMERCE: ${{ inputs.cancel_ecommerce }}
+          INPUT_ECOMMERCE_MODE: ${{ inputs.ecommerce_mode }}
           INPUT_REQUIRE_EVENT_TARGET: ${{ inputs.require_event_target }}
           INPUT_HOST: ${{ inputs.kibo_host || 'tp3.mozu.com' }}
           INPUT_LIMIT: ${{ inputs.limit || '0' }}
@@ -316,9 +320,15 @@ jobs:
           WAREHOUSE_FLAG=""
           if [ "$INPUT_WAREHOUSE_CANCEL" = "false" ]; then WAREHOUSE_FLAG="--no-warehouse-cancel"; fi
           ECOM_FLAG=""
-          if [ "$INPUT_CANCEL_ECOMMERCE" = "true" ]; then ECOM_FLAG="--cancel-ecommerce"; fi
+          REASSIGN_ECOM_FLAG=""
+          case "$INPUT_ECOMMERCE_MODE" in
+            "reassign only") REASSIGN_ECOM_FLAG="--reassign-ecommerce" ;;
+            "reassign + cancel on repeats")
+              REASSIGN_ECOM_FLAG="--reassign-ecommerce"
+              ECOM_FLAG="--cancel-ecommerce" ;;
+          esac
           EVENT_TARGET_FLAG=""
-          if [ "$INPUT_REQUIRE_EVENT_TARGET" = "false" ]; then EVENT_TARGET_FLAG="--no-require-event-target"; fi
+          if [ "$INPUT_REQUIRE_EVENT_TARGET" = "true" ]; then EVENT_TARGET_FLAG="--require-event-target"; fi
           python cancel_cancelled_shipments.py \
             $DRY_RUN_FLAG \
             $BLOCK_FLAG \
@@ -327,6 +337,7 @@ jobs:
             $WAREHOUSE_FLAG \
             $EVENT_TARGET_FLAG \
             $ECOM_FLAG \
+            $REASSIGN_ECOM_FLAG \
             --oms-status "$INPUT_OMS_STATUS" \
             --no-picked-reason "$INPUT_NO_PICKED_REASON" \
             --ecommerce-channel "$INPUT_ECOMMERCE_CHANNEL" \
