@@ -982,6 +982,7 @@ class Candidate:
     cancelled_order_generations: str = ""
     latest_event_type: str = ""
     latest_event_shipment_order_number: str = ""
+    picked_from: str = ""
     repeat_cancel: str = ""
     resolution: str = ""
     resolution_source: str = ""
@@ -1291,6 +1292,11 @@ class OrderEvents:
     latest_event_son: str = ""
     latest_event_payload: Optional[Dict[str, Any]] = None
     ordered: bool = False
+    # Per generation: its own latest event, and its own latest PICKED payload. The
+    # moved-on rule and the reason code are decided from the generation that is
+    # actually READY, not from whichever generation of the order moved last.
+    latest_by_son: Dict[str, Tuple[str, Optional[Dict[str, Any]]]] = field(default_factory=dict)
+    picked_by_son: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     logistic_numbers: List[str] = field(default_factory=list)
     cancelled_logistic_numbers: List[str] = field(default_factory=list)
     # {shipmentOrderNumber: products} for the generations carrying a CANCELLED event.
@@ -1371,6 +1377,11 @@ def fetch_order_events(
                     events.latest_event_type = event_type
                     events.latest_event_son = number
                     events.latest_event_payload = payload
+                if number not in events.latest_by_son:
+                    events.latest_by_son[number] = (event_type, payload)
+                if event_type == PICKED_EVENT_TYPE and number not in events.picked_by_son:
+                    if payload is not None:
+                        events.picked_by_son[number] = payload
                 if event_type in CANCELLED_EVENT_TYPES:
                     events.has_cancelled = True
                     events.cancelled_products |= products
@@ -1389,7 +1400,7 @@ def fetch_order_events(
     return found
 
 
-def warehouse_moved_on_of(events: OrderEvents) -> Tuple[bool, str]:
+def warehouse_moved_on_of(events: OrderEvents, son: str) -> Tuple[bool, str]:
     """
     Whether the warehouse has moved on from the cancellations and is picking again.
 
@@ -1401,25 +1412,44 @@ def warehouse_moved_on_of(events: OrderEvents) -> Tuple[bool, str]:
         WF-EUA00019586  CANCELLED        12 Nov 10:33   qty 1
         WF-EUB00019586  PICKED           16 Nov 17:40   qty 1   <- latest, picked
 
-    The rule is the order's LATEST warehouse event: a PICKED whose total quantity is not
-    zero means the goods were found and nothing should be touched. A PICKED of quantity
-    zero is the opposite — nothing was found — and is the normal prelude to a
-    cancellation, so it does not stop the workflow.
+    The rule is read on ONE generation — the one that is READY, passed as `son` — and
+    not on the order as a whole, because a cancellation and a successful pick usually
+    belong to two different shipments:
+
+        WF-EUA00019586  CANCELLED  12 Nov   qty 1    <- an older, dead generation
+        WF-EUB00019586  PICKED     16 Nov   qty 1    <- READY, the warehouse is picking it
+
+    Here the non-zero PICKED belongs to the READY shipment, so nothing is cancelled.
+    Had the non-zero PICKED belonged to some other generation while the READY one
+    carried the cancellation, the READY shipment would still be cancelled: another
+    shipment being picked says nothing about this one.
+
+    When the READY generation carries BOTH — a PICKED of non-zero quantity and then a
+    CANCELLED — the cancellation is the later word and the shipment is cancelled, with
+    the reason "Customer Changed Their Mind". That is why only the generation's LATEST
+    event counts, not merely the presence of a pick.
+
+    A generation with no events of its own (the usual case: Kibo has just reassigned
+    into a fresh one) does not fire the rule, so the workflow continues.
 
     Returns (moved_on, why). It never fires when the rows could not be ordered by time,
     since "latest" would then be meaningless.
     """
-    if not events.ordered or events.latest_event_type != PICKED_EVENT_TYPE:
+    if not events.ordered or not son:
         return False, ""
-    if events.latest_event_payload is None:
+    latest = events.latest_by_son.get(son)
+    if latest is None:
         return False, ""
-    total, found = picked_quantity_of(events.latest_event_payload)
+    event_type, payload = latest
+    if event_type != PICKED_EVENT_TYPE or payload is None:
+        return False, ""
+    total, found = picked_quantity_of(payload)
     if not found or total == 0:
         return False, ""
     return True, (
-        f"The latest warehouse event of the order is a PICKED of quantity "
-        f"{format_quantity(total)} on {events.latest_event_son}: the warehouse is "
-        "working this shipment, so nothing was cancelled."
+        f"The latest warehouse event of {son}, the READY shipment, is a PICKED of "
+        f"quantity {format_quantity(total)}: the warehouse is picking this shipment, "
+        "so nothing was cancelled."
     )
 
 
@@ -2128,7 +2158,8 @@ CSV_FIELDS = [
     "oms_shipment_number", "sixth_character", "oms_channel", "kibo_channel", "channel", "channel_source",
     "order_pattern", "cancelled_products", "cancelled_order_shipments",
     "cancelled_order_shipment_numbers", "cancelled_order_generations",
-    "latest_event_type", "latest_event_shipment_order_number", "repeat_cancel",
+    "latest_event_type", "latest_event_shipment_order_number", "picked_from",
+    "repeat_cancel",
     "resolution", "resolution_source", "has_cancelled_event", "has_picked_event", "picked_quantity",
     "logistic_order_number", "kibo_shipment_number", "number_matches_oms",
     "external_order_id", "event_shipment_number", "latest_cancelled_shipment_number",
@@ -2646,7 +2677,7 @@ def main() -> int:
         # PICKED that actually picked something, the goods were found and the shipment
         # is being worked; the older cancellations are history. Checked before the
         # CANCELLED test so no Kibo call and no CANCEL to GXO is ever made for it.
-        moved_on, why = warehouse_moved_on_of(events)
+        moved_on, why = warehouse_moved_on_of(events, candidate.shipment_order_number)
         if moved_on:
             candidate.action = "warehouse_picked"
             candidate.success = True
@@ -2664,9 +2695,21 @@ def main() -> int:
             rows.append(candidate)
             continue
 
-        # The PICKED quantity decides the reason sent to Kibo.
-        if events.has_picked and events.picked_payload is not None:
-            total, found = picked_quantity_of(events.picked_payload)
+        # The PICKED quantity decides the reason sent to Kibo. The READY generation's
+        # own PICKED wins when it has one, so a shipment that was picked and then
+        # cancelled is reported as "Customer Changed Their Mind" rather than taking the
+        # quantity from whichever other generation happened to be picked last.
+        picked_payload = (
+            events.picked_by_son.get(candidate.shipment_order_number)
+            or events.picked_payload
+        )
+        candidate.picked_from = (
+            candidate.shipment_order_number
+            if candidate.shipment_order_number in events.picked_by_son
+            else events.picked_shipment_order_number
+        )
+        if events.has_picked and picked_payload is not None:
+            total, found = picked_quantity_of(picked_payload)
             if not found:
                 candidate.action = "skipped"
                 candidate.error = "The PICKED requestPayload carries no quantity field."
