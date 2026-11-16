@@ -7,6 +7,9 @@ go back through order routing and land in backorder; everything else is cancelle
 ecommerce shipment whose order — every `shipmentOrderNumber` matching
 `LIKE 'DJ-US%ST0000124550'` — has already had the same products cancelled under more
 than three of them is cancelled too, because routing has run out of places to try.
+Because Kibo auto reassigns a shipment the moment the warehouse cancels it, a
+cancellation is applied to the replacement shipment of the same order, not to the
+`REASSIGNED` `shipmentNumber` the event names.
 
 ## Repository layout
 
@@ -225,6 +228,55 @@ is visible in the CSV instead of becoming a cancellation on the wrong shipment.
 If `oms_active_shipments` turns out to have no shipment number column, the script warns
 once, skips the check, and marks those rows `unchecked`.
 
+## Which shipment actually gets cancelled
+
+That `shipmentNumber` identifies the shipment the warehouse was working on — and by the
+time this job runs, Kibo has already auto reassigned it. The shipment is `REASSIGNED`,
+which Kibo will not cancel, and the work has moved to a **new** `shipmentNumber` that
+can be cancelled. So whenever the outcome is a cancellation, the target is resolved
+against the order rather than taken from the event:
+
+`GET https://t{tenantId}.tp3.mozu.com/api/commerce/shipments?filter=externalOrderId=={externalOrderId}`
+
+The Shipment API has its own filter syntax (`field==value`, clauses joined by `;`),
+unlike the `field eq value` of the other Kibo APIs — see
+[Querying Order Shipments](https://docs.kibocommerce.com/pages/fulfillment-api-overview).
+Only the `externalOrderId` clause is sent; the statuses are filtered in the script, so
+every sibling shipment and its status lands in the CSV as `order_shipments`.
+
+**The externalOrderId** comes from the shipment read in step 5. If that field is empty,
+it is derived from the `shipmentOrderNumber` by putting the 6th character — the
+generation letter — back to a hyphen, the inverse of what the `release-held-exchange`
+job does:
+
+| shipmentOrderNumber | externalOrderId |
+| --- | --- |
+| `DJ-USAST0000124550` | `DJ-US-ST0000124550` |
+
+**The target** is the shipment of that order which is both
+
+- in a cancellable status: not already `CANCELED`, nor any other terminal status
+  (`CLOSED`, `SHIPPED`, …), nor `REASSIGNED`, which Kibo refuses as well. `READY`,
+  `BACKORDER` and everything else are valid targets; `cancel_target_excluded_statuses`
+  (empty by default) can exclude more.
+- carrying the exact same products as the `CANCELLED` event: every product of the event
+  is on the shipment, **and** every item of the shipment is in the event. A Kibo item
+  names the same product several ways at once (`productCode`, `variationProductCode`,
+  `upc`) while the payload names it once, so the comparison is per item rather than one
+  flat set. `product_match` `overlap` only asks for one product in common, `any` skips
+  the check.
+
+| outcome | what happens |
+| --- | --- |
+| exactly one match | that `shipmentNumber` is cancelled; the CSV keeps the original in `event_shipment_number` |
+| no match | the shipment the event names is cancelled, as before, with `cancel_target_source = event (no match on the order)` |
+| several matches | nothing is touched, row reported as `ambiguous_cancel_target`; `on_multiple_cancel_targets = newest` cancels the most recently created one instead |
+
+The lookup runs only for cancellations. Reassignments still act on the shipment the
+event names, where a shipment already `REASSIGNED` or `BACKORDER` is reported as
+`already_reassigned` and left alone. Set `resolve_cancel_target` to `false` to go back
+to cancelling the `shipmentNumber` the event names.
+
 ## Workflow inputs
 
 | Input | Default | Meaning |
@@ -242,6 +294,12 @@ once, skips the check, and marks those rows `unchecked`.
 | `repeat_cancel` | `true` | Cancel an ecommerce shipment instead of reassigning it when the same products of the order have been cancelled too often |
 | `max_cancelled_order_shipments` | `3` | How many cancelled `shipmentOrderNumber`s of one order are tolerated before cancelling instead of reassigning |
 | `product_match` | `exact` | How "the same products" is decided: `exact`, `overlap` or `any` |
+| `resolve_cancel_target` | `true` | Cancel the shipment of the order found by `externalOrderId` instead of the one the event names |
+
+`cancel_target_excluded_statuses` (empty by default) and `on_multiple_cancel_targets`
+(default `skip`, or `newest`) are command-line flags only — `workflow_dispatch` is
+already well past GitHub's documented limit of 10 inputs, so they were left out of the
+run form.
 
 A shipment whose PICKED payload carries no `quantity` field at all is skipped and
 reported, rather than treated as zero.
@@ -255,10 +313,16 @@ writes a summary table to the run page. One row per Kibo shipment, with
 `cancelled_order_shipment_numbers`, `repeat_cancel` (`yes`, `no` or `unknown`),
 `resolution` (`cancel` or `reassign`), `resolution_source`, `has_cancelled_event`, `has_picked_event`,
 `picked_quantity`, `reason_code`, `logistic_order_number`, `kibo_shipment_number`,
-`number_matches_oms`, the Kibo status before and after, `kibo_reason_after`, the
-action (`canceled`, `reassigned`, `would_cancel`, `would_reassign`, `already_terminal`,
-`already_reassigned`, `sixth_character_excluded`, `skipped`, `read_failed`,
+`number_matches_oms`, `external_order_id`, `event_shipment_number`, `order_shipments`,
+`cancel_target_candidates`, `cancel_target_source`, the Kibo status before and after,
+`kibo_reason_after`, the action (`canceled`, `reassigned`, `would_cancel`,
+`would_reassign`, `already_terminal`, `already_reassigned`, `ambiguous_cancel_target`,
+`sixth_character_excluded`, `skipped`, `read_failed`, `order_lookup_failed`,
 `cancel_failed`, `reassign_failed`), and the error when there is one.
+
+`kibo_shipment_number` is the shipment that was acted on; when the order lookup moved
+the cancellation to the replacement shipment, the original is in
+`event_shipment_number` and the summary table shows it as `82999 (was 82902)`.
 
 For an ecommerce shipment, `kibo_status_after` is where routing put it: `BACKORDER` when
 no location could take it, otherwise the new state.
