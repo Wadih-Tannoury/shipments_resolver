@@ -108,6 +108,10 @@ on:
         description: "cancel-cancelled: send the CANCEL event to GXO before cancelling in Kibo"
         type: boolean
         default: true
+      require_event_target:
+        description: "cancel-cancelled: cancel in Kibo only when the latest CANCELLED event names the READY GXO shipment (otherwise warehouse only)"
+        type: boolean
+        default: true
       repeat_cancel:
         description: "cancel-cancelled: cancel an ecommerce shipment instead of reassigning it when the same products of the order keep coming back cancelled"
         type: boolean
@@ -301,6 +305,7 @@ jobs:
           INPUT_CANCEL_TARGET_LOCATION_PATTERN: ${{ inputs.cancel_target_location_pattern || '%GX%' }}
           INPUT_ON_NO_CANCEL_TARGET: ${{ inputs.on_no_cancel_target || 'skip' }}
           INPUT_WAREHOUSE_CANCEL: ${{ inputs.warehouse_cancel }}
+          INPUT_REQUIRE_EVENT_TARGET: ${{ inputs.require_event_target }}
           INPUT_HOST: ${{ inputs.kibo_host || 'tp3.mozu.com' }}
           INPUT_LIMIT: ${{ inputs.limit || '0' }}
           INPUT_NUMBERS: ${{ inputs.numbers }}
@@ -316,12 +321,15 @@ jobs:
           if [ "$INPUT_RESOLVE_CANCEL_TARGET" = "false" ]; then TARGET_FLAG="--no-resolve-cancel-target"; fi
           WAREHOUSE_FLAG=""
           if [ "$INPUT_WAREHOUSE_CANCEL" = "false" ]; then WAREHOUSE_FLAG="--no-warehouse-cancel"; fi
+          EVENT_TARGET_FLAG=""
+          if [ "$INPUT_REQUIRE_EVENT_TARGET" = "false" ]; then EVENT_TARGET_FLAG="--no-require-event-target"; fi
           python cancel_cancelled_shipments.py \
             $DRY_RUN_FLAG \
             $BLOCK_FLAG \
             $REPEAT_FLAG \
             $TARGET_FLAG \
             $WAREHOUSE_FLAG \
+            $EVENT_TARGET_FLAG \
             --oms-status "$INPUT_OMS_STATUS" \
             --no-picked-reason "$INPUT_NO_PICKED_REASON" \
             --ecommerce-channel "$INPUT_ECOMMERCE_CHANNEL" \
