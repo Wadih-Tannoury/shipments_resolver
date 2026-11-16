@@ -974,6 +974,7 @@ class Candidate:
     cancelled_products: str = ""
     cancelled_order_shipments: str = ""
     cancelled_order_shipment_numbers: str = ""
+    cancelled_order_generations: str = ""
     repeat_cancel: str = ""
     resolution: str = ""
     resolution_source: str = ""
@@ -1259,6 +1260,113 @@ class WarehouseOrder:
     brand_code: str = ""
 
 
+@dataclass
+class OrderEvents:
+    """
+    The CANCELLED / PICKED events of one ORDER, across every generation.
+
+    The active shipment of an order usually carries NO events of its own: the warehouse
+    cancels generation F, Kibo immediately reassigns into a brand new generation G, and
+    G is what sits READY in oms_active_shipments while every CANCELLED event still names
+    A to F. Keying the lookup on the active row's own shipmentOrderNumber therefore
+    finds nothing and the order is skipped forever, which is why the events are read per
+    order instead.
+    """
+    has_cancelled: bool = False
+    has_picked: bool = False
+    picked_payload: Optional[Dict[str, Any]] = None
+    picked_shipment_order_number: str = ""
+    logistic_numbers: List[str] = field(default_factory=list)
+    cancelled_logistic_numbers: List[str] = field(default_factory=list)
+    # {shipmentOrderNumber: products} for the generations carrying a CANCELLED event.
+    cancelled_sons: Dict[str, frozenset] = field(default_factory=dict)
+    cancelled_products: frozenset = frozenset()
+
+
+def fetch_order_events(
+    client: bigquery.Client,
+    order_patterns: Sequence[str],
+    product_keys: Sequence[str],
+    pattern_batch_size: int,
+) -> Dict[str, OrderEvents]:
+    """
+    Return {orderPattern: OrderEvents}, reading prd_shipmentStatus once per order.
+
+        SELECT * FROM `tlg-wlfs-prd`.til.prd_shipmentStatus
+        WHERE shipmentOrderNumber LIKE 'FE-EU%00136449'
+
+    One query carries many patterns; each row is handed back to the pattern or patterns
+    it belongs to in Python. Rows come back newest first when the table has a usable
+    timestamp column, so the first PICKED payload of an order is its most recent one and
+    the first CANCELLED logisticOrderNumber names the latest cancellation.
+
+    This replaces both the old per-shipmentOrderNumber event read and the separate
+    repeat-cancellation query: the cancelled generations counted by that rule are the
+    same rows, so one pass serves both.
+    """
+    where = f"`{WLFS_PROJECT}.{WLFS_DATASET}.{SHIPMENT_STATUS_TABLE}`"
+    columns = table_columns(client, WLFS_PROJECT, WLFS_DATASET, SHIPMENT_STATUS_TABLE)
+    number_col = resolve_column(columns, SHIPMENT_NUMBER_CANDIDATES, where)
+    payload_col = resolve_column(columns, PAYLOAD_CANDIDATES, where)
+    event_col = resolve_column(columns, EVENT_TYPE_CANDIDATES, where)
+    ts_col = resolve_column(columns, TIMESTAMP_CANDIDATES, where, required=False)
+
+    order_by = f"ORDER BY `{ts_col}` DESC" if ts_col else ""
+    wanted = list(CANCELLED_EVENT_TYPES) + [PICKED_EVENT_TYPE]
+    sql = f"""
+        SELECT
+            CAST(`{number_col}` AS STRING) AS shipment_order_number,
+            UPPER(CAST(`{event_col}` AS STRING)) AS event_type,
+            CAST(`{payload_col}` AS STRING) AS payload
+        FROM {where}
+        WHERE UPPER(CAST(`{event_col}` AS STRING)) IN UNNEST(@event_types)
+          AND EXISTS (
+              SELECT 1 FROM UNNEST(@order_patterns) AS order_pattern
+              WHERE CAST(`{number_col}` AS STRING) LIKE order_pattern
+          )
+        {order_by}
+    """
+
+    found: Dict[str, OrderEvents] = {pattern: OrderEvents() for pattern in order_patterns}
+    for batch in chunked(list(order_patterns), max(1, pattern_batch_size)):
+        job = client.query(
+            sql,
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ArrayQueryParameter("order_patterns", "STRING", batch),
+                bigquery.ArrayQueryParameter("event_types", "STRING", wanted),
+            ]),
+        )
+        for row in job.result():
+            number = clean(row["shipment_order_number"])
+            if not number:
+                continue
+            event_type = clean(row["event_type"]).upper()
+            payload = parse_payload(row["payload"])
+            products = products_of(payload, product_keys) if payload else frozenset()
+            logistic = logistic_order_number_of(payload) if payload else ""
+
+            for pattern in batch:
+                if not matches_order_pattern(number, pattern):
+                    continue
+                events = found.setdefault(pattern, OrderEvents())
+                if event_type in CANCELLED_EVENT_TYPES:
+                    events.has_cancelled = True
+                    events.cancelled_products |= products
+                    events.cancelled_sons[number] = (
+                        events.cancelled_sons.get(number, frozenset()) | products
+                    )
+                    if logistic and logistic not in events.cancelled_logistic_numbers:
+                        events.cancelled_logistic_numbers.append(logistic)
+                elif event_type == PICKED_EVENT_TYPE:
+                    events.has_picked = True
+                    if payload is not None and events.picked_payload is None:
+                        events.picked_payload = payload
+                        events.picked_shipment_order_number = number
+                if logistic and logistic not in events.logistic_numbers:
+                    events.logistic_numbers.append(logistic)
+    return found
+
+
 def warehouse_order_from_shipment(shipment: Dict[str, Any]) -> WarehouseOrder:
     """
     The CANCEL event's fields read off the Kibo shipment itself.
@@ -1379,8 +1487,10 @@ def repeat_cancellation(
         if number == candidate.shipment_order_number
         or products_match(own_products, products, product_match)
     ]
-    if candidate.shipment_order_number not in matched:
-        matched.append(candidate.shipment_order_number)
+    # The shipment being processed counts only if it actually carries a CANCELLED event
+    # of its own. Usually it does not: it is the fresh generation Kibo reassigned into
+    # after the warehouse cancelled the previous one, and adding it would report one
+    # cancellation more than the warehouse has really sent.
     return len(matched), sorted(matched)
 
 
@@ -1961,7 +2071,7 @@ CSV_FIELDS = [
     "oms_tenant_id", "oms_site_id", "tenant_source", "oms_shipment_status",
     "oms_shipment_number", "sixth_character", "oms_channel", "kibo_channel", "channel", "channel_source",
     "order_pattern", "cancelled_products", "cancelled_order_shipments",
-    "cancelled_order_shipment_numbers", "repeat_cancel",
+    "cancelled_order_shipment_numbers", "cancelled_order_generations", "repeat_cancel",
     "resolution", "resolution_source", "has_cancelled_event", "has_picked_event", "picked_quantity",
     "logistic_order_number", "kibo_shipment_number", "number_matches_oms",
     "external_order_id", "event_shipment_number", "latest_cancelled_shipment_number",
@@ -2345,11 +2455,31 @@ def main() -> int:
         log(
             f"Left alone, 6th character not in {args.allowed_sixth_characters}: {excluded_count}"
         )
-    events_by_number = fetch_status_events(
-        wlfs_client, numbers, args.batch_size, args.product_keys
+    # One read per ORDER, covering every generation. The active shipment of an order
+    # rarely carries events of its own, so this is what makes an order visible at all,
+    # and the same rows feed the repeat-cancellation rule.
+    all_patterns = sorted({
+        pattern for pattern in (order_pattern_of(number) for number in numbers) if pattern
+    })
+    without_pattern = len(numbers) - sum(
+        1 for number in numbers if order_pattern_of(number)
     )
-    with_cancelled = sum(1 for e in events_by_number.values() if e.has_cancelled)
-    log(f"Shipment order numbers with a CANCELLED event: {with_cancelled}")
+    if without_pattern:
+        warn(
+            f"{without_pattern} shipment order number(s) have no usable order pattern "
+            "and cannot be matched to their order's events."
+        )
+    log(
+        f"Orders to read from {SHIPMENT_STATUS_TABLE}: {len(all_patterns)} "
+        f"(LIKE patterns, {args.pattern_batch_size} per query"
+        + (f", e.g. {all_patterns[0]}" if all_patterns else "")
+        + ")"
+    )
+    order_events = fetch_order_events(
+        wlfs_client, all_patterns, args.product_keys, args.pattern_batch_size
+    )
+    with_cancelled = sum(1 for e in order_events.values() if e.has_cancelled)
+    log(f"Orders with a CANCELLED event on some generation: {with_cancelled}")
 
     kibo = KiboClient({"client_id": client_id, "client_secret": client_secret},
                       args.auth_url, args.host, args.timeout)
@@ -2418,20 +2548,27 @@ def main() -> int:
             rows.append(candidate)
             continue
 
-        events = events_by_number.get(candidate.shipment_order_number, StatusEvents())
+        # The events are read for the whole ORDER, not for this generation alone. The
+        # active shipment is usually a generation the warehouse has never seen: GXO
+        # cancels F, Kibo reassigns into a new G, and G is what sits READY here while
+        # every CANCELLED event still names A to F. Looking only at G's own
+        # shipmentOrderNumber finds nothing and the order is never acted on.
+        candidate.order_pattern = order_pattern_of(candidate.shipment_order_number)
+        events = order_events.get(candidate.order_pattern, OrderEvents())
         candidate.has_cancelled_event = events.has_cancelled
         candidate.has_picked_event = events.has_picked
-        # Both feed the repeat-cancellation rule. The order is identified by the
-        # shipmentOrderNumber with its generation letter wildcarded, since
-        # prd_shipmentStatus carries no order number: DJ-USAST0000124550 is looked up as
-        # LIKE 'DJ-US%ST0000124550'.
-        candidate.order_pattern = order_pattern_of(candidate.shipment_order_number)
         candidate.cancelled_products = format_products(events.cancelled_products)
+        # The products of the order's cancellations stand in for this generation's own,
+        # which are usually absent: they are what the cancel target has to carry.
         products_by_number[candidate.shipment_order_number] = events.cancelled_products
+        candidate.cancelled_order_generations = ", ".join(sorted(events.cancelled_sons))
 
         if not events.has_cancelled:
             candidate.action = "skipped"
-            candidate.error = "No CANCELLED event in prd_shipmentStatus."
+            candidate.error = (
+                "No CANCELLED event in prd_shipmentStatus for any generation of order "
+                f"{candidate.order_pattern or candidate.shipment_order_number}."
+            )
             rows.append(candidate)
             continue
 
@@ -2452,7 +2589,10 @@ def main() -> int:
             continue
         elif args.no_picked_reason == "skip":
             candidate.action = "skipped"
-            candidate.error = "No PICKED event in prd_shipmentStatus."
+            candidate.error = (
+                "No PICKED event in prd_shipmentStatus for any generation of order "
+                f"{candidate.order_pattern or candidate.shipment_order_number}."
+            )
             rows.append(candidate)
             continue
         else:
@@ -2460,79 +2600,47 @@ def main() -> int:
                 REASON_NO_INVENTORY if args.no_picked_reason == "no-inventory" else REASON_CUSTOMER
             )
 
-        if not events.logistic_numbers:
-            candidate.action = "skipped"
-            candidate.error = "No logisticOrderNumber in the CANCELLED or PICKED requestPayload."
-            rows.append(candidate)
-            continue
-
         # The shipment the LATEST cancellation names. prd_shipmentStatus is read newest
         # first, so the first CANCELLED logisticOrderNumber is the most recent one.
         # Kibo is only cancelled when this is the shipment that is READY in a GXO
         # location, i.e. when the warehouse cancelled the shipment it is still holding
         # rather than one Kibo has already reassigned away from it.
         if events.cancelled_logistic_numbers:
+            candidate.logistic_order_number = events.cancelled_logistic_numbers[0]
             latest_number, latest_error = kibo_number_from_logistic(
-                events.cancelled_logistic_numbers[0]
+                candidate.logistic_order_number
             )
             candidate.latest_cancelled_shipment_number = latest_number
             if latest_error:
                 warn(f"{candidate.shipment_order_number}: {latest_error}")
 
-        # The PICKED / CANCELLED events were matched on shipmentOrderNumber; the Kibo
-        # shipmentNumber taken from logisticOrderNumber has to match the shipment
-        # number of the same oms_active_shipments row. One shipment order number can
-        # carry several logisticOrderNumber values, and only the matching one is the
-        # Kibo shipment of this row.
+        # The starting shipmentNumber is the ACTIVE one of this oms_active_shipments
+        # row, not one derived from a logisticOrderNumber: the events name generations
+        # Kibo has already reassigned away, so their numbers are stale. Step 4b then
+        # resolves the real cancel target against the order anyway. Only when the OMS
+        # table carries no shipment number does the latest cancellation's number stand
+        # in, which is the old behaviour.
         expected = clean(candidate.oms_shipment_number)
-        if len(events.logistic_numbers) > 1:
-            log(
-                f"{candidate.shipment_order_number}: {len(events.logistic_numbers)} "
-                f"logisticOrderNumber values ({', '.join(events.logistic_numbers)})"
-            )
-
-        derived: List[Tuple[str, str]] = []  # (logisticOrderNumber, kiboShipmentNumber)
-        conversion_errors: List[str] = []
-        seen_shipment_numbers: set[str] = set()
-        for logistic in events.logistic_numbers:
-            number, error = kibo_number_from_logistic(logistic)
-            if error:
-                conversion_errors.append(error)
-                continue
-            if number in seen_shipment_numbers:
-                continue
-            seen_shipment_numbers.add(number)
-            derived.append((logistic, number))
-
         if expected:
-            matching = [(l, n) for l, n in derived if n == expected]
+            candidate.kibo_shipment_number = expected
+            candidate.number_matches_oms = (
+                "yes" if expected == candidate.latest_cancelled_shipment_number else "no"
+            )
+        elif candidate.latest_cancelled_shipment_number:
+            candidate.kibo_shipment_number = candidate.latest_cancelled_shipment_number
+            candidate.number_matches_oms = "unchecked"
         else:
-            # No shipment number in oms_active_shipments: nothing to check against.
-            matching = derived
-
-        if not matching:
             candidate.action = "skipped"
-            if expected and derived:
-                candidate.number_matches_oms = "no"
-                candidate.logistic_order_number = derived[0][0]
-                candidate.error = (
-                    f"No logisticOrderNumber matches oms shipment number {expected} "
-                    f"(payload gives {', '.join(n for _, n in derived)})."
-                )
-            elif conversion_errors:
-                candidate.error = conversion_errors[0]
-            else:
-                candidate.error = "No logisticOrderNumber in the CANCELLED or PICKED requestPayload."
+            candidate.error = (
+                f"{BI_TABLE} carries no shipment number and no logisticOrderNumber was "
+                "found in the order's CANCELLED payloads, so there is no Kibo shipment "
+                "to act on."
+            )
             rows.append(candidate)
             continue
 
-        for logistic, number in matching:
-            row = replace(candidate)
-            row.logistic_order_number = logistic
-            row.kibo_shipment_number = number
-            row.number_matches_oms = "yes" if expected else "unchecked"
-            eligible.append(row)
-            rows.append(row)
+        eligible.append(candidate)
+        rows.append(candidate)
 
     log(f"Eligible shipments to cancel: {len(eligible)}")
     log(
@@ -2540,27 +2648,13 @@ def main() -> int:
         f"reason '{REASON_NO_INVENTORY}': {sum(1 for c in eligible if c.reason_code == REASON_NO_INVENTORY)}"
     )
 
-    # The repeat-cancellation rule needs every CANCELLED shipmentOrderNumber of each
-    # order, including the generations that have already dropped out of
-    # oms_active_shipments, so prd_shipmentStatus is read once more with
-    # `shipmentOrderNumber LIKE 'DJ-US%ST0000124550'` per order.
-    cancelled_by_order: Dict[str, Dict[str, frozenset]] = {}
-    if args.repeat_cancel and args.ecommerce_channel and eligible:
-        order_patterns = sorted({c.order_pattern for c in eligible if c.order_pattern})
-        if order_patterns:
-            log(
-                f"Orders checked for repeat cancellations: {len(order_patterns)} "
-                f"(LIKE patterns, {args.pattern_batch_size} per query, "
-                f"e.g. {order_patterns[0]})"
-            )
-            cancelled_by_order = fetch_cancelled_order_shipments(
-                wlfs_client, order_patterns, args.batch_size, args.product_keys,
-                args.pattern_batch_size,
-            )
-            log(
-                "Orders with a CANCELLED event: "
-                f"{sum(1 for v in cancelled_by_order.values() if v)}"
-            )
+    # The repeat-cancellation rule counts the cancelled generations of each order. Those
+    # are already in hand: fetch_order_events read every generation of every order, not
+    # just the ones still in oms_active_shipments, so no second query is needed.
+    cancelled_by_order: Dict[str, Dict[str, frozenset]] = {
+        pattern: events.cancelled_sons for pattern, events in order_events.items()
+    }
+    if args.repeat_cancel and args.ecommerce_channel:
         missing = sum(1 for c in eligible if not c.order_pattern)
         if missing:
             warn(
