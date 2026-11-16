@@ -168,6 +168,11 @@ Pipeline
 5c. Channel IS ecommerce, but the same products of the same order have already been
     cancelled too many times  ->  cancel instead of reassigning.
 
+    CURRENTLY DISABLED. --cancel-ecommerce is off by default, so an ecommerce shipment
+    is never cancelled: it is always auto reassigned, whatever the count below says, and
+    no CANCEL is sent to the warehouse for it. The rest of this step describes what
+    happens once --cancel-ecommerce is passed.
+
     Reassigning only helps while some other location might still fulfil the order. Once
     the same products have come back CANCELLED under more than 3 distinct
     shipmentOrderNumber values of the same order number, routing has run out of places
@@ -2158,6 +2163,7 @@ def write_job_summary(candidates: List[Candidate], dry_run: bool) -> None:
     excluded = [c for c in candidates if c.action == "sixth_character_excluded"]
     unknown_brand = [c for c in candidates if c.action == "unknown_brand"]
     warehouse_picked = [c for c in candidates if c.action == "warehouse_picked"]
+    ecommerce_blocked = [c for c in candidates if c.repeat_cancel == "blocked"]
     retenanted = [c for c in candidates if c.oms_tenant_id and (
         c.oms_tenant_id != c.tenant_id or c.oms_site_id != c.site_id)]
     failed = [c for c in candidates if c.error]
@@ -2200,6 +2206,8 @@ def write_job_summary(candidates: List[Candidate], dry_run: bool) -> None:
         f"- Already in a terminal or reassigned status: **{len(already)}**",
         f"- Tenant/site taken from the brand config rather than {BI_TABLE}: "
         f"**{len(retenanted)}**",
+        f"- Ecommerce reassigned rather than cancelled, cancellation disabled: "
+        f"**{len(ecommerce_blocked)}**",
         f"- Left alone, the warehouse's latest event is a successful PICKED: "
         f"**{len(warehouse_picked)}**",
         f"- Left alone, brand not in the Kibo config: **{len(unknown_brand)}**",
@@ -2338,6 +2346,13 @@ def parse_args() -> argparse.Namespace:
                         help="Order LIKE patterns per BigQuery query when counting the cancelled "
                              "shipmentOrderNumbers of an order. Smaller than --batch-size because "
                              "LIKE cannot use an index and every pattern widens the scan.")
+    parser.add_argument("--cancel-ecommerce", dest="cancel_ecommerce", action="store_true",
+                        help="Allow an ecommerce shipment to be cancelled when the "
+                             "repeat-cancellation rule fires. OFF BY DEFAULT: for now an "
+                             "ecommerce shipment is never cancelled and is always auto "
+                             "reassigned instead, however often the order has come back "
+                             "cancelled. Non-ecommerce shipments are unaffected.")
+    parser.set_defaults(cancel_ecommerce=False)
     parser.add_argument("--no-repeat-cancel", dest="repeat_cancel", action="store_false",
                         help="Turn the repeat-cancellation rule off: ecommerce shipments are always "
                              "auto reassigned, however often the order has been cancelled before.")
@@ -2420,7 +2435,14 @@ def main() -> int:
             f"Channel '{args.ecommerce_channel}': auto reassign instead of cancel "
             f"(blockAssignment={'true' if args.block_assignment else 'false'})"
         )
-        if args.repeat_cancel:
+        if not args.cancel_ecommerce:
+            log(
+                "  ECOMMERCE CANCELLATION DISABLED: an ecommerce shipment is never "
+                "cancelled, however often the order has come back cancelled, and no "
+                "CANCEL is sent to the warehouse for one. Pass --cancel-ecommerce to "
+                "re-enable the repeat-cancellation rule."
+            )
+        elif args.repeat_cancel:
             log(
                 f"  except when more than {args.max_cancelled_order_shipments} "
                 f"shipmentOrderNumber values of the same order carry a CANCELLED "
@@ -2807,7 +2829,16 @@ def main() -> int:
         # send it. Once the same products of this order have come back CANCELLED under
         # more than --max-cancelled-order-shipments shipmentOrderNumbers, reassigning
         # again would just bounce it once more, so the READY shipment is cancelled.
-        if is_ecommerce and args.repeat_cancel:
+        # A kill switch over everything below: while it is on, an ecommerce shipment is
+        # NEVER cancelled, whatever the repeat-cancellation rule would say. It is always
+        # auto reassigned instead, so routing keeps the order alive and the warehouse is
+        # not told to cancel. Turn it off with --cancel-ecommerce to restore the
+        # repeat-cancellation behaviour.
+        if is_ecommerce and not args.cancel_ecommerce:
+            candidate.repeat_cancel = "blocked"
+            candidate.resolution = RESOLUTION_REASSIGN
+            candidate.resolution_source = "channel (ecommerce cancellation disabled)"
+        elif is_ecommerce and args.repeat_cancel:
             if not candidate.order_pattern:
                 candidate.repeat_cancel = "unknown"
                 candidate.resolution_source = (
