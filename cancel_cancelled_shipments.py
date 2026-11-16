@@ -117,6 +117,20 @@ Pipeline
    GXO refusing the POST -> `warehouse_cancel_failed`, and Kibo is left untouched.
    --no-warehouse-cancel skips the whole step and cancels in Kibo only, as before.
 
+4d. Kibo is cancelled ONLY when the shipment named by the LATEST CANCELLED event is the
+   cancel target itself, that is, when the warehouse cancelled the very shipment that is
+   now READY in a GXO location.
+
+   When the two differ, GXO cancelled a shipment Kibo has already reassigned away from
+   it, and the READY GXO shipment is a replacement the warehouse has not cancelled yet.
+   Cancelling it in Kibo would throw away a shipment the floor still considers live, so
+   only the CANCEL event goes out and the row is reported as `canceled_warehouse_only`.
+   GXO then answers with its own CANCELLED event for that shipment, and the next run —
+   where the latest cancellation does name the READY GXO shipment — cancels it in Kibo.
+   The CANCELLED events are read newest first, so the first logisticOrderNumber carried
+   by a CANCELLED payload is the latest cancellation. --no-require-event-target cancels
+   in Kibo regardless, as before.
+
 5a. Channel is NOT ecommerce  ->  cancel the shipment:
 
        PUT https://t{tenantId}.{host}/api/commerce/shipments/{shipmentNumber}/canceled
@@ -881,6 +895,8 @@ class Candidate:
     number_matches_oms: str = ""
     external_order_id: str = ""
     event_shipment_number: str = ""
+    latest_cancelled_shipment_number: str = ""
+    event_is_cancel_target: str = ""
     order_shipments: str = ""
     cancel_target_candidates: str = ""
     cancel_target_source: str = ""
@@ -911,6 +927,10 @@ class StatusEvents:
     picked_payload: Optional[Dict[str, Any]] = None
     # Every distinct logisticOrderNumber carried by the events, newest first.
     logistic_numbers: List[str] = field(default_factory=list)
+    # The same, but only from the CANCELLED events, newest first. The first entry is
+    # therefore the shipment the LATEST cancellation names, which is what decides
+    # whether Kibo is cancelled as well as the warehouse.
+    cancelled_logistic_numbers: List[str] = field(default_factory=list)
     # The products the CANCELLED events name, for the repeat-cancellation rule of 5c.
     cancelled_products: frozenset = frozenset()
 
@@ -1066,6 +1086,9 @@ def fetch_status_events(
             logistic = logistic_order_number_of(payload)
             if logistic and logistic not in events.logistic_numbers:
                 events.logistic_numbers.append(logistic)
+            if (event_type in CANCELLED_EVENT_TYPES and logistic
+                    and logistic not in events.cancelled_logistic_numbers):
+                events.cancelled_logistic_numbers.append(logistic)
     return found
 
 
@@ -1711,7 +1734,8 @@ CSV_FIELDS = [
     "cancelled_order_shipment_numbers", "repeat_cancel",
     "resolution", "resolution_source", "has_cancelled_event", "has_picked_event", "picked_quantity",
     "logistic_order_number", "kibo_shipment_number", "number_matches_oms",
-    "external_order_id", "event_shipment_number", "order_shipments",
+    "external_order_id", "event_shipment_number", "latest_cancelled_shipment_number",
+    "event_is_cancel_target", "order_shipments",
     "cancel_target_candidates", "cancel_target_source", "cancel_target_location",
     "warehouse_shipment_order_number", "warehouse_logistic_order_number",
     "warehouse_location_code", "warehouse_brand_code", "warehouse_event_id",
@@ -1751,6 +1775,7 @@ def write_job_summary(candidates: List[Candidate], dry_run: bool) -> None:
     ambiguous = [c for c in candidates if c.action == "ambiguous_cancel_target"]
     no_target = [c for c in candidates if c.action == "no_cancel_target"]
     warehouse_sent = [c for c in candidates if c.warehouse_action == "sent"]
+    warehouse_only = [c for c in candidates if c.action == "canceled_warehouse_only"]
     warehouse_failed = [c for c in candidates if c.action == "warehouse_cancel_failed"]
     no_warehouse_row = [c for c in candidates if c.action == "no_warehouse_order_row"]
     lines = [
@@ -1769,6 +1794,8 @@ def write_job_summary(candidates: List[Candidate], dry_run: bool) -> None:
         f"- Cancelled on the order's replacement shipment rather than the one the event "
         f"names: **{len(retargeted)}**",
         f"- CANCEL events accepted by the warehouse: **{len(warehouse_sent)}**",
+        f"- Warehouse only, the latest CANCELLED event is not the READY GXO shipment "
+        f"(Kibo waits for GXO to confirm): **{len(warehouse_only)}**",
         f"- Left alone, the warehouse refused the CANCEL: **{len(warehouse_failed)}**",
         f"- Left alone, no {ORDERS_TABLE} row for the cancel target: **{len(no_warehouse_row)}**",
         f"- Left alone, no READY shipment of the order in a GXO location: **{len(no_target)}**",
@@ -1872,6 +1899,14 @@ def parse_args() -> argparse.Namespace:
                              "location with the same products: 'skip' reports the row as "
                              "no_cancel_target and touches nothing, 'event' falls back to "
                              "the shipmentNumber the CANCELLED event names, as before.")
+    parser.add_argument("--no-require-event-target", dest="require_event_target",
+                        action="store_false",
+                        help="Cancel in Kibo even when the latest CANCELLED event names a "
+                             "different shipment than the READY GXO one. By default Kibo is "
+                             "only cancelled when the warehouse cancelled the very shipment "
+                             "it is holding; otherwise the CANCEL event is sent to GXO and "
+                             "Kibo is left to the next run, once GXO has confirmed.")
+    parser.set_defaults(require_event_target=True)
     parser.add_argument("--no-warehouse-cancel", dest="warehouse_cancel",
                         action="store_false",
                         help="Do not send the CANCEL event to GXO; cancel in Kibo only. "
@@ -2016,6 +2051,14 @@ def main() -> int:
         )
     else:
         log("Warehouse cancellation disabled: Kibo is cancelled without telling GXO.")
+    if args.require_event_target:
+        log(
+            "Kibo is cancelled only when the latest CANCELLED event names the READY GXO "
+            "shipment; otherwise the warehouse is told and Kibo waits for GXO's own "
+            "CANCELLED event."
+        )
+    else:
+        log("Kibo is cancelled whichever shipment the latest CANCELLED event names.")
     log(f"Kibo host: {args.host}")
 
     kibo_credentials = load_json_env("KIBO_API_CREDS")
@@ -2139,6 +2182,19 @@ def main() -> int:
             candidate.error = "No logisticOrderNumber in the CANCELLED or PICKED requestPayload."
             rows.append(candidate)
             continue
+
+        # The shipment the LATEST cancellation names. prd_shipmentStatus is read newest
+        # first, so the first CANCELLED logisticOrderNumber is the most recent one.
+        # Kibo is only cancelled when this is the shipment that is READY in a GXO
+        # location, i.e. when the warehouse cancelled the shipment it is still holding
+        # rather than one Kibo has already reassigned away from it.
+        if events.cancelled_logistic_numbers:
+            latest_number, latest_error = kibo_number_from_logistic(
+                events.cancelled_logistic_numbers[0]
+            )
+            candidate.latest_cancelled_shipment_number = latest_number
+            if latest_error:
+                warn(f"{candidate.shipment_order_number}: {latest_error}")
 
         # The PICKED / CANCELLED events were matched on shipmentOrderNumber; the Kibo
         # shipmentNumber taken from logisticOrderNumber has to match the shipment
@@ -2438,6 +2494,35 @@ def main() -> int:
         # cancel target in prd_orders has to exist. It is looked up by the target's own
         # shipmentNumber, not by the one the CANCELLED event named: after step 4b those
         # are usually two different shipments, and GXO is holding the target.
+        # Kibo is cancelled only when the shipment named by the LATEST CANCELLED event
+        # is itself the cancel target, i.e. the one that is READY in a GXO location.
+        #
+        # When it is not, the warehouse cancelled a shipment Kibo has already reassigned
+        # elsewhere, and the READY GXO shipment is a replacement GXO has not cancelled
+        # yet. Cancelling it in Kibo would throw away a shipment the floor still
+        # considers live, so only the CANCEL event goes out; GXO answers with its own
+        # CANCELLED event for that shipment, and the next run — where the latest
+        # cancellation does name the READY GXO shipment — cancels it in Kibo.
+        cancel_in_kibo = True
+        if candidate.resolution == RESOLUTION_CANCEL and args.require_event_target:
+            latest = candidate.latest_cancelled_shipment_number or candidate.event_shipment_number
+            cancel_in_kibo = bool(latest) and latest == candidate.kibo_shipment_number
+            candidate.event_is_cancel_target = "yes" if cancel_in_kibo else "no"
+            if not cancel_in_kibo:
+                log(
+                    f"    the latest CANCELLED event names {latest or 'nothing'}, not the "
+                    f"READY GXO shipment {candidate.kibo_shipment_number}: warehouse only, "
+                    "Kibo is left alone."
+                )
+                if not args.warehouse_cancel:
+                    candidate.action = "not_cancel_target"
+                    candidate.error = (
+                        f"The latest CANCELLED event names {latest or 'nothing'}, not the "
+                        f"READY GXO shipment {candidate.kibo_shipment_number}, and the "
+                        "warehouse step is disabled, so there was nothing to do."
+                    )
+                    continue
+
         warehouse_order: Optional[WarehouseOrder] = None
         if candidate.resolution == RESOLUTION_CANCEL and args.warehouse_cancel:
             warehouse_order = warehouse_orders.get(candidate.kibo_shipment_number)
@@ -2460,9 +2545,12 @@ def main() -> int:
             candidate.warehouse_brand_code = warehouse_order.brand_code
 
         if args.dry_run:
-            candidate.action = (
-                "would_reassign" if candidate.resolution == RESOLUTION_REASSIGN else "would_cancel"
-            )
+            if candidate.resolution == RESOLUTION_REASSIGN:
+                candidate.action = "would_reassign"
+            elif cancel_in_kibo:
+                candidate.action = "would_cancel"
+            else:
+                candidate.action = "would_cancel_warehouse_only"
             candidate.success = True
             candidate.response_excerpt = (
                 "DRY RUN - the reassigned endpoint was not called"
@@ -2520,6 +2608,21 @@ def main() -> int:
                     f"{warehouse_order.logistic_order_number} @ "
                     f"{warehouse_order.location_name}"
                 )
+
+            if not cancel_in_kibo:
+                # The warehouse has been told; Kibo keeps the shipment until GXO sends
+                # back its own CANCELLED event for it, which a later run acts on.
+                candidate.action = "canceled_warehouse_only"
+                candidate.success = True
+                candidate.response_excerpt = candidate.warehouse_response
+                log(
+                    "    warehouse only: Kibo keeps "
+                    f"{candidate.kibo_shipment_number} until GXO confirms the "
+                    "cancellation with its own CANCELLED event."
+                )
+                if args.sleep_between_requests > 0:
+                    time.sleep(args.sleep_between_requests)
+                continue
 
             ok, error, excerpt = kibo.mark_canceled(
                 candidate.tenant_id, candidate.site_id, candidate.kibo_shipment_number,
@@ -2579,7 +2682,9 @@ def main() -> int:
         f"repeat-cancellation rule), "
         f"{sum(1 for c in eligible if c.action == 'reassigned' and c.success)} auto reassigned, "
         f"{sum(1 for c in eligible if c.warehouse_action == 'sent')} CANCEL events sent to "
-        f"the warehouse, "
+        f"the warehouse (of which "
+        f"{sum(1 for c in eligible if c.action == 'canceled_warehouse_only')} warehouse only, "
+        f"Kibo left for a later run), "
         f"{sum(1 for c in eligible if c.action == 'no_cancel_target')} with no READY GXO "
         f"shipment on the order, "
         f"{sum(1 for c in rows if c.action == 'sixth_character_excluded')} left alone on the "
