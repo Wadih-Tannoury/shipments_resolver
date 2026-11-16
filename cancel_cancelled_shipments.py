@@ -249,6 +249,55 @@ GXO_REASON_MESSAGE = "Kibo notification cancellation"
 # default. Numeric so it works on Python < 3.12 as well.
 SSL_OP_LEGACY_SERVER_CONNECT = 0x4
 
+# The Kibo tenant and site of each brand. oms_active_shipments carries a tenant_id and
+# a site_id of its own, but they are not always the ones the Shipment API expects: a
+# wrong x-vol-site scopes a filtered query to a site that holds none of the order's
+# shipments, and Kibo answers 200 with an empty page rather than an error, which looks
+# exactly like "this order has no shipments". This table is the authority, and the
+# brand is taken from the start of the shipmentOrderNumber.
+BRAND_KIBO_CONFIG: Dict[str, Tuple[str, str]] = {
+    # brand: (kiboSiteId, kiboTenantId)
+    "DG": ("49791", "29916"),
+    "LN": ("49801", "29917"),
+    "MO": ("53100", "29988"),
+    "SC": ("53620", "29989"),
+    "CO": ("53190", "29990"),
+    "RC": ("53192", "29990"),
+    "WL": ("53613", "29991"),
+    "SW": ("52246", "29992"),
+    "CA": ("53602", "29993"),
+    "HB": ("60955", "30014"),
+    "BA": ("53088", "30014"),
+    "CV": ("60958", "30014"),
+    "OW": ("53145", "30016"),
+    "RL": ("53145", "30016"),
+    "VW": ("53605", "30017"),
+    "FA": ("53605", "30017"),
+    "DJ": ("53592", "30018"),
+    "AT": ("53155", "30019"),
+    "LA": ("53157", "30019"),
+    "CL": ("53139", "30020"),
+    "PL": ("53139", "30020"),
+    "HE": ("53148", "30021"),
+    "FE": ("53097", "30022"),
+    "CR": ("53095", "30022"),
+    "EFOT": ("53166", "30023"),
+    "EF": ("53166", "30023"),
+    "FO": ("53163", "30023"),
+    "PJ": ("53179", "30475"),
+    "TM": ("53493", "32145"),
+    "FU": ("53493", "32145"),
+    "VE": ("53636", "32147"),
+    "ZH": ("53636", "32147"),
+    "WF": ("53636", "32147"),
+    "BO": ("54979", "33692"),
+    "MA": ("55105", "33693"),
+    "FL": ("55105", "33693"),
+    "PA": ("55105", "33693"),
+    "AL": ("55105", "33693"),
+    "BB": ("54981", "33694"),
+}
+
 DEFAULT_HOST = "tp3.mozu.com"
 DEFAULT_AUTH_URL = "https://home.mozu.com/api/platform/applications/authtickets/oauth"
 
@@ -466,6 +515,26 @@ def sixth_character_allowed(shipment_order_number: str, allowed: str) -> bool:
         return True
     character = sixth_character_of(shipment_order_number)
     return bool(character) and character in allowed
+
+
+def brand_of(shipment_order_number: str) -> str:
+    """
+    The brand code at the start of a shipmentOrderNumber.
+
+    "WL-FF-WST191241581" -> "WL", "DG-EUA01688483" -> "DG". The longest configured code
+    wins, so EFOT is not read as EF. Returns "" when nothing in BRAND_KIBO_CONFIG
+    matches.
+    """
+    value = clean(shipment_order_number).upper()
+    for code in sorted(BRAND_KIBO_CONFIG, key=len, reverse=True):
+        if value.startswith(code):
+            return code
+    return ""
+
+
+def kibo_config_for_brand(brand: str) -> Tuple[str, str]:
+    """(siteId, tenantId) for a brand code, or ("", "") when it is not configured."""
+    return BRAND_KIBO_CONFIG.get(clean(brand).upper(), ("", ""))
 
 
 def order_pattern_of(shipment_order_number: str) -> str:
@@ -875,6 +944,10 @@ class Candidate:
     site_id: str
     oms_shipment_status: str = ""
     oms_shipment_number: str = ""
+    brand: str = ""
+    oms_tenant_id: str = ""
+    oms_site_id: str = ""
+    tenant_source: str = ""
     sixth_character: str = ""
     oms_channel: str = ""
     kibo_channel: str = ""
@@ -1509,9 +1582,14 @@ class KiboClient:
         ';' — unlike the `field eq value` of the other Kibo APIs. Only the
         externalOrderId clause is sent; the statuses are filtered in Python so that one
         response shows every sibling shipment, whatever its status, in the CSV.
+
+        NO x-vol-site header is sent. The site scopes the query, so a site that does not
+        hold the order's shipments turns the answer into an empty page with a 200 rather
+        than an error, which is indistinguishable from an order that really has no
+        shipments. The tenant alone is what identifies the order here.
         """
         response, error = self.request(
-            "GET", self.shipments_url(tenant_id), tenant_id, site_id,
+            "GET", self.shipments_url(tenant_id), tenant_id, "",
             max_retries=max_retries,
             params={
                 "filter": SHIPMENTS_FILTER_TEMPLATE.format(value=external_order_id),
@@ -1728,7 +1806,8 @@ def shipment_status(shipment: Dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 CSV_FIELDS = [
-    "shipment_order_number", "tenant_id", "site_id", "oms_shipment_status",
+    "shipment_order_number", "tenant_id", "site_id", "brand",
+    "oms_tenant_id", "oms_site_id", "tenant_source", "oms_shipment_status",
     "oms_shipment_number", "sixth_character", "oms_channel", "kibo_channel", "channel", "channel_source",
     "order_pattern", "cancelled_products", "cancelled_order_shipments",
     "cancelled_order_shipment_numbers", "repeat_cancel",
@@ -1763,6 +1842,9 @@ def write_job_summary(candidates: List[Candidate], dry_run: bool) -> None:
     reassigned = [c for c in candidates if c.action == "reassigned" and c.success]
     already = [c for c in candidates if c.action in ("already_terminal", "already_reassigned")]
     excluded = [c for c in candidates if c.action == "sixth_character_excluded"]
+    unknown_brand = [c for c in candidates if c.action == "unknown_brand"]
+    retenanted = [c for c in candidates if c.oms_tenant_id and (
+        c.oms_tenant_id != c.tenant_id or c.oms_site_id != c.site_id)]
     failed = [c for c in candidates if c.error]
     customer = [c for c in eligible if c.reason_code == REASON_CUSTOMER]
     no_inventory = [c for c in eligible if c.reason_code == REASON_NO_INVENTORY]
@@ -1801,6 +1883,9 @@ def write_job_summary(candidates: List[Candidate], dry_run: bool) -> None:
         f"- Left alone, no READY shipment of the order in a GXO location: **{len(no_target)}**",
         f"- Left alone, several cancellable shipments of the order match: **{len(ambiguous)}**",
         f"- Already in a terminal or reassigned status: **{len(already)}**",
+        f"- Tenant/site taken from the brand config rather than {BI_TABLE}: "
+        f"**{len(retenanted)}**",
+        f"- Left alone, brand not in the Kibo config: **{len(unknown_brand)}**",
         f"- Left alone, 6th character not allowed: **{len(excluded)}**",
         f"- With an error: **{len(failed)}**",
         "",
@@ -1899,6 +1984,11 @@ def parse_args() -> argparse.Namespace:
                              "location with the same products: 'skip' reports the row as "
                              "no_cancel_target and touches nothing, 'event' falls back to "
                              "the shipmentNumber the CANCELLED event names, as before.")
+    parser.add_argument("--allow-unknown-brand", action="store_true",
+                        help="Process a shipment whose brand is not in BRAND_KIBO_CONFIG, "
+                             "using the tenant_id and site_id from oms_active_shipments. "
+                             "Off by default: an unconfirmed tenant means a filtered Kibo "
+                             "query can come back empty instead of failing.")
     parser.add_argument("--no-require-event-target", dest="require_event_target",
                         action="store_false",
                         help="Cancel in Kibo even when the latest CANCELLED event names a "
@@ -2122,6 +2212,39 @@ def main() -> int:
         # The 6th character of the shipmentOrderNumber gates the whole workflow: a
         # shipment outside the allowed set is left alone, neither cancelled nor
         # reassigned. Checked first so no Kibo call is made for it at all.
+        # The brand decides the Kibo tenant and site. oms_active_shipments carries its
+        # own pair, but they can disagree with the Shipment API's, and a wrong site
+        # silently empties a filtered query instead of failing, so the configured values
+        # win and any disagreement is reported.
+        candidate.oms_tenant_id = candidate.tenant_id
+        candidate.oms_site_id = candidate.site_id
+        candidate.brand = brand_of(candidate.shipment_order_number)
+        config_site, config_tenant = kibo_config_for_brand(candidate.brand)
+        if config_tenant:
+            if (config_tenant != candidate.tenant_id
+                    or config_site != candidate.site_id):
+                warn(
+                    f"{candidate.shipment_order_number}: {BI_TABLE} says tenant "
+                    f"{candidate.tenant_id}/site {candidate.site_id}, brand "
+                    f"{candidate.brand} is configured as tenant {config_tenant}/site "
+                    f"{config_site}. Using the configured pair."
+                )
+            candidate.tenant_id = config_tenant
+            candidate.site_id = config_site
+            candidate.tenant_source = f"brand {candidate.brand}"
+        else:
+            candidate.tenant_source = BI_TABLE
+            if not args.allow_unknown_brand:
+                candidate.action = "unknown_brand"
+                candidate.error = (
+                    f"No brand in BRAND_KIBO_CONFIG matches shipmentOrderNumber "
+                    f"'{candidate.shipment_order_number}', so the Kibo tenant and site "
+                    "cannot be confirmed. --allow-unknown-brand uses the "
+                    f"{BI_TABLE} values instead."
+                )
+                rows.append(candidate)
+                continue
+
         candidate.sixth_character = sixth_character_of(candidate.shipment_order_number)
         if not sixth_character_allowed(candidate.shipment_order_number, args.allowed_sixth_characters):
             candidate.action = "sixth_character_excluded"
