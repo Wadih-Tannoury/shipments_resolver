@@ -979,6 +979,7 @@ class Candidate:
     warehouse_location_code: str = ""
     warehouse_brand_code: str = ""
     warehouse_event_id: str = ""
+    warehouse_source: str = ""
     warehouse_action: str = ""
     warehouse_response: str = ""
     reason_code: str = ""
@@ -1239,6 +1240,35 @@ class WarehouseOrder:
     location_name: str = ""
     brand: str = ""
     brand_code: str = ""
+
+
+def warehouse_order_from_shipment(shipment: Dict[str, Any]) -> WarehouseOrder:
+    """
+    The CANCEL event's fields read off the Kibo shipment itself.
+
+    The shipment carries everything GXO needs, which is more reliable than looking the
+    row up in prd_orders by a reverse-engineered key:
+
+        data.shipmentOrderNumber   "DG-EUA01688483"  (the generation GXO is holding)
+        data.brandCode             "15"
+        fulfillmentLocationCode    "TLITGX0015"
+
+    Only the logisticOrderNumber is absent, so it is rebuilt the way the rest of this
+    script reads it: the 2-character brand prefix of the shipmentOrderNumber followed by
+    the Kibo shipmentNumber, the inverse of kibo_number_from_logistic. prd_orders stays
+    the preferred source and this is the fallback.
+    """
+    data = shipment.get("data") if isinstance(shipment.get("data"), dict) else {}
+    order_number = clean(data.get("shipmentOrderNumber")) or clean(data.get("xpoOrderId"))
+    shipment_number = shipment_number_of(shipment)
+    prefix = order_number[:2].upper() if len(order_number) >= 2 else ""
+    return WarehouseOrder(
+        shipment_order_number=order_number,
+        logistic_order_number=f"{prefix}{shipment_number}" if prefix and shipment_number else "",
+        location_name=shipment_fulfillment_location(shipment),
+        brand=brand_of(order_number),
+        brand_code=clean(data.get("brandCode")),
+    )
 
 
 def fetch_warehouse_orders(
@@ -1588,29 +1618,44 @@ class KiboClient:
         than an error, which is indistinguishable from an order that really has no
         shipments. The tenant alone is what identifies the order here.
         """
-        response, error = self.request(
-            "GET", self.shipments_url(tenant_id), tenant_id, "",
-            max_retries=max_retries,
-            params={
-                "filter": SHIPMENTS_FILTER_TEMPLATE.format(value=external_order_id),
-                "pageSize": int(page_size),
-            },
-        )
-        if response is None:
-            return [], error
-        if not (200 <= response.status_code < 300):
-            return [], f"HTTP {response.status_code}: {excerpt_of(response, 300)}"
-        try:
-            payload = response.json()
-        except ValueError:
-            return [], "The shipments response was not JSON."
-        if isinstance(payload, list):
-            items = payload
-        elif isinstance(payload, dict):
-            items = payload.get("items") or payload.get("shipments") or []
-        else:
-            items = []
-        return [item for item in items if isinstance(item, dict)], ""
+        shipments: List[Dict[str, Any]] = []
+        page = 0
+        while True:
+            response, error = self.request(
+                "GET", self.shipments_url(tenant_id), tenant_id, "",
+                max_retries=max_retries,
+                params={
+                    "filter": SHIPMENTS_FILTER_TEMPLATE.format(value=external_order_id),
+                    "pageSize": int(page_size),
+                    "page": page,
+                },
+            )
+            if response is None:
+                return shipments, error
+            if not (200 <= response.status_code < 300):
+                return shipments, f"HTTP {response.status_code}: {excerpt_of(response, 300)}"
+            try:
+                payload = response.json()
+            except ValueError:
+                return shipments, "The shipments response was not JSON."
+
+            batch = shipments_in_response(payload)
+            shipments.extend(batch)
+
+            # {"_embedded": {...}, "page": {"size", "totalElements", "totalPages",
+            #  "number"}}. Stop on the last page, and stop too if a page comes back
+            # empty, so a server that ignores `page` cannot loop forever.
+            page_info = payload.get("page") if isinstance(payload, dict) else None
+            total_pages = 0
+            if isinstance(page_info, dict):
+                try:
+                    total_pages = int(page_info.get("totalPages") or 0)
+                except (TypeError, ValueError):
+                    total_pages = 0
+            page += 1
+            if not batch or total_pages <= page:
+                break
+        return shipments, ""
 
     def mark_canceled(
         self, tenant_id: str, site_id: str, shipment_number: str, reason: str,
@@ -1747,12 +1792,55 @@ class GxoClient:
         return False, last_error or "Unknown error", ""
 
 
+def shipments_in_response(payload: Any) -> List[Dict[str, Any]]:
+    """
+    The shipments carried by a getShipments response, whatever shape it arrives in.
+
+    The Shipment API answers with HAL:
+
+        {"_embedded": {"shipments": [...]}, "_links": {...}, "page": {...}}
+
+    so the list sits under _embedded, NOT at the top level. Reading only `items` or
+    `shipments` from the top level returns nothing for every order, which looks exactly
+    like an order with no shipments. The flatter shapes are kept as fallbacks in case a
+    tenant or a future version answers differently.
+    """
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        return []
+    embedded = payload.get("_embedded")
+    if isinstance(embedded, dict):
+        for key in ("shipments", "items"):
+            value = embedded.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+    for key in ("shipments", "items"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    return []
+
+
 def shipment_channel(shipment: Dict[str, Any]) -> str:
-    """The shipment's channel as Kibo reports it."""
+    """
+    The shipment's channel as Kibo reports it.
+
+    Kibo does not put the channel on the shipment: it sits on each item, inside its
+    `data` map ("data": {"channel": "ecommerce", ...}). Looking only at the top level
+    reports every shipment as channel unknown, which sends an ecommerce shipment down
+    the cancel path instead of the reassign one, so the nesting is searched too. The
+    first non-empty value wins; items of one shipment share a channel in practice.
+    """
     for key in ("channel", "channelName", "salesChannel"):
         value = clean(shipment.get(key))
         if value:
             return value
+    for key in ("channel", "channelName", "salesChannel"):
+        for value in iter_values(shipment, key):
+            text = clean(value)
+            if text:
+                return text
     return ""
 
 
@@ -1818,6 +1906,7 @@ CSV_FIELDS = [
     "cancel_target_candidates", "cancel_target_source", "cancel_target_location",
     "warehouse_shipment_order_number", "warehouse_logistic_order_number",
     "warehouse_location_code", "warehouse_brand_code", "warehouse_event_id",
+    "warehouse_source",
     "warehouse_action", "warehouse_response", "reason_code",
     "kibo_status_before", "kibo_status_after", "kibo_reason_after",
     "action", "success", "error", "response_excerpt", "correlation_id",
@@ -2649,6 +2738,21 @@ def main() -> int:
         warehouse_order: Optional[WarehouseOrder] = None
         if candidate.resolution == RESOLUTION_CANCEL and args.warehouse_cancel:
             warehouse_order = warehouse_orders.get(candidate.kibo_shipment_number)
+            if warehouse_order is None:
+                # prd_orders has no row for the target. The Kibo shipment carries the
+                # same fields, so the CANCEL event can still be built from it.
+                from_kibo = warehouse_order_from_shipment(shipment)
+                if from_kibo.shipment_order_number and from_kibo.logistic_order_number:
+                    warehouse_order = from_kibo
+                    candidate.warehouse_source = "kibo shipment"
+                    warn(
+                        f"    no {ORDERS_TABLE} row for shipmentNumber "
+                        f"{candidate.kibo_shipment_number}; building the CANCEL event "
+                        f"from the Kibo shipment ({from_kibo.shipment_order_number} / "
+                        f"{from_kibo.logistic_order_number})."
+                    )
+            else:
+                candidate.warehouse_source = ORDERS_TABLE
             if warehouse_order is None:
                 candidate.action = "no_warehouse_order_row"
                 candidate.error = (
