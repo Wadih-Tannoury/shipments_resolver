@@ -88,9 +88,26 @@ on:
         type: boolean
         default: false
       allowed_sixth_characters:
-        description: "cancel-cancelled: only act when the 6th character of the shipmentOrderNumber is one of these (empty = no rule)"
+        description: "cancel-cancelled: optional filter, only act when the generation letter (6th character) is one of these (empty = every generation, the default)"
         type: string
-        default: "ABCD"
+        default: ""
+      cancel_target_status:
+        description: "cancel-cancelled: shipmentStatus the cancel target must have (empty = any cancellable status)"
+        type: string
+        default: "READY"
+      cancel_target_location_pattern:
+        description: "cancel-cancelled: LIKE pattern the cancel target's fulfillmentLocationCode must match (empty = any location)"
+        type: string
+        default: "%GX%"
+      on_no_cancel_target:
+        description: "cancel-cancelled: when no READY shipment of the order sits in a GXO location with the same products"
+        type: choice
+        options: ["skip", "event"]
+        default: "skip"
+      warehouse_cancel:
+        description: "cancel-cancelled: send the CANCEL event to GXO before cancelling in Kibo"
+        type: boolean
+        default: true
       repeat_cancel:
         description: "cancel-cancelled: cancel an ecommerce shipment instead of reassigning it when the same products of the order keep coming back cancelled"
         type: boolean
@@ -270,6 +287,7 @@ jobs:
           BI_BIGQUERY_CREDS: ${{ secrets.BI_BIGQUERY_CREDS }}
           TIL_BIGQUERY_CREDS: ${{ secrets.TIL_BIGQUERY_CREDS }}
           KIBO_API_CREDS: ${{ secrets.KIBO_API_CREDS }}
+          GXO_API_CREDS: ${{ secrets.GXO_API_CREDS }}
           INPUT_OMS_STATUS: ${{ inputs.cancel_oms_status }}
           INPUT_NO_PICKED_REASON: ${{ inputs.no_picked_reason || 'skip' }}
           INPUT_ECOMMERCE_CHANNEL: ${{ inputs.ecommerce_channel }}
@@ -279,6 +297,10 @@ jobs:
           INPUT_MAX_CANCELLED_ORDER_SHIPMENTS: ${{ inputs.max_cancelled_order_shipments || '3' }}
           INPUT_PRODUCT_MATCH: ${{ inputs.product_match || 'exact' }}
           INPUT_RESOLVE_CANCEL_TARGET: ${{ inputs.resolve_cancel_target }}
+          INPUT_CANCEL_TARGET_STATUS: ${{ inputs.cancel_target_status || 'READY' }}
+          INPUT_CANCEL_TARGET_LOCATION_PATTERN: ${{ inputs.cancel_target_location_pattern || '%GX%' }}
+          INPUT_ON_NO_CANCEL_TARGET: ${{ inputs.on_no_cancel_target || 'skip' }}
+          INPUT_WAREHOUSE_CANCEL: ${{ inputs.warehouse_cancel }}
           INPUT_HOST: ${{ inputs.kibo_host || 'tp3.mozu.com' }}
           INPUT_LIMIT: ${{ inputs.limit || '0' }}
           INPUT_NUMBERS: ${{ inputs.numbers }}
@@ -292,17 +314,23 @@ jobs:
           if [ "$INPUT_REPEAT_CANCEL" = "false" ]; then REPEAT_FLAG="--no-repeat-cancel"; fi
           TARGET_FLAG=""
           if [ "$INPUT_RESOLVE_CANCEL_TARGET" = "false" ]; then TARGET_FLAG="--no-resolve-cancel-target"; fi
+          WAREHOUSE_FLAG=""
+          if [ "$INPUT_WAREHOUSE_CANCEL" = "false" ]; then WAREHOUSE_FLAG="--no-warehouse-cancel"; fi
           python cancel_cancelled_shipments.py \
             $DRY_RUN_FLAG \
             $BLOCK_FLAG \
             $REPEAT_FLAG \
             $TARGET_FLAG \
+            $WAREHOUSE_FLAG \
             --oms-status "$INPUT_OMS_STATUS" \
             --no-picked-reason "$INPUT_NO_PICKED_REASON" \
             --ecommerce-channel "$INPUT_ECOMMERCE_CHANNEL" \
             --max-cancelled-order-shipments "$INPUT_MAX_CANCELLED_ORDER_SHIPMENTS" \
             --product-match "$INPUT_PRODUCT_MATCH" \
             --allowed-sixth-characters "$INPUT_ALLOWED_SIXTH" \
+            --cancel-target-status "$INPUT_CANCEL_TARGET_STATUS" \
+            --cancel-target-location-pattern "$INPUT_CANCEL_TARGET_LOCATION_PATTERN" \
+            --on-no-cancel-target "$INPUT_ON_NO_CANCEL_TARGET" \
             --host "$INPUT_HOST" \
             --limit "$INPUT_LIMIT" \
             --shipment-order-numbers "$INPUT_NUMBERS" \
