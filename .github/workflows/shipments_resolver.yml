@@ -107,6 +107,10 @@ on:
           - overlap
           - any
         default: exact
+      resolve_cancel_target:
+        description: "cancel-cancelled: cancel the shipment of the order found by externalOrderId instead of the REASSIGNED one the event names"
+        type: boolean
+        default: true
       location_column:
         description: "reassign-blocked: monitoring table column holding the fulfillment location CODE (empty = auto-detect)"
         type: string
@@ -274,6 +278,7 @@ jobs:
           INPUT_REPEAT_CANCEL: ${{ inputs.repeat_cancel }}
           INPUT_MAX_CANCELLED_ORDER_SHIPMENTS: ${{ inputs.max_cancelled_order_shipments || '3' }}
           INPUT_PRODUCT_MATCH: ${{ inputs.product_match || 'exact' }}
+          INPUT_RESOLVE_CANCEL_TARGET: ${{ inputs.resolve_cancel_target }}
           INPUT_HOST: ${{ inputs.kibo_host || 'tp3.mozu.com' }}
           INPUT_LIMIT: ${{ inputs.limit || '0' }}
           INPUT_NUMBERS: ${{ inputs.numbers }}
@@ -285,10 +290,13 @@ jobs:
           if [ "$INPUT_BLOCK_ASSIGNMENT" = "true" ]; then BLOCK_FLAG="--block-assignment"; fi
           REPEAT_FLAG=""
           if [ "$INPUT_REPEAT_CANCEL" = "false" ]; then REPEAT_FLAG="--no-repeat-cancel"; fi
+          TARGET_FLAG=""
+          if [ "$INPUT_RESOLVE_CANCEL_TARGET" = "false" ]; then TARGET_FLAG="--no-resolve-cancel-target"; fi
           python cancel_cancelled_shipments.py \
             $DRY_RUN_FLAG \
             $BLOCK_FLAG \
             $REPEAT_FLAG \
+            $TARGET_FLAG \
             --oms-status "$INPUT_OMS_STATUS" \
             --no-picked-reason "$INPUT_NO_PICKED_REASON" \
             --ecommerce-channel "$INPUT_ECOMMERCE_CHANNEL" \
