@@ -4,12 +4,12 @@ Cancel in Kibo the shipments that the warehouse has already cancelled.
 
 Pipeline
 --------
-0. The 6th character of the shipmentOrderNumber gates everything below. Counting every
-   character, the hyphen included, it has to be one of A, B, C or D; otherwise the
-   shipment is left alone, neither cancelled nor reassigned, and reported as
-   `sixth_character_excluded`. "DJ-USA00041696" is in scope, "DJ-USE00041696",
-   "DJ-USF00041696" and "DJ-USI00041696" are not. The set is configurable with
-   --allowed-sixth-characters, and an empty value turns the rule off.
+0. Every generation letter is in scope. The 6th character of the shipmentOrderNumber,
+   counting every character with the hyphen included, is the generation letter that
+   identifies the order ("DJ-USA00041696", "DJ-USE00041696" and "DJ-USI00041696" are
+   three generations of one order) and it is read for that purpose only: it does not
+   gate the workflow. --allowed-sixth-characters still exists and is EMPTY by default,
+   so nothing is excluded; pass a set of letters to narrow a run by hand.
 
 1. Read the active shipments from BigQuery (BI project):
        `tlg-business-intelligence-prd`.til.oms_active_shipments
@@ -66,18 +66,56 @@ Pipeline
 
    Out of the shipments of that order, the target is the one that
 
+     - has shipmentStatus READY (--cancel-target-status, empty to accept any
+       cancellable status instead)
+     - sits in a GXO location: fulfillmentLocationCode LIKE '%GX%'
+       (--cancel-target-location-pattern, empty to drop the check)
      - is in a cancellable status: not already CANCELED, nor any other terminal status
        (CLOSED, SHIPPED, ...), nor REASSIGNED, which Kibo refuses as well. Statuses can
-       be excluded on top of those with --cancel-target-excluded-statuses, empty by
-       default: READY, BACKORDER and the rest are all valid targets.
+       be excluded on top of those with --cancel-target-excluded-statuses.
      - carries the exact same products as the CANCELLED event: every product of the
        event is on the shipment and every item of the shipment is in the event.
        --product-match overlap only asks for one product in common, any skips the check
 
-   When nothing matches, the shipment named by the event is cancelled as before. When
-   several match, the row is reported as `ambiguous_cancel_target` and left alone;
-   --on-multiple-cancel-targets newest takes the most recent one instead. The whole
-   step is skipped with --no-resolve-cancel-target.
+   When several match, the row is reported as `ambiguous_cancel_target` and left alone;
+   --on-multiple-cancel-targets newest takes the most recent one instead. When nothing
+   matches, the row is reported as `no_cancel_target` and left alone, because the point
+   of the lookup is to find the shipment the warehouse is actually holding;
+   --on-no-cancel-target event restores the old fallback to the shipment the event
+   names. The whole step is skipped with --no-resolve-cancel-target.
+
+4c. A cancellation is sent to the warehouse FIRST, and Kibo is only cancelled once GXO
+   has accepted it, so the two systems cannot drift apart.
+
+       POST https://prdedi.gxo.com:4084/sync/mft/tlg_it/shipmentStatusUpdate
+
+       {"eventType": "CANCEL", "eventClass": "SHIPMENT", "eventId": "<uuid>",
+        "eventTimestamp": "...Z",
+        "data": {"shipmentOrderNumber": ..., "logisticOrderNumber": ...,
+                 "locationCode": ..., "brandCode": ..., "brand": ...,
+                 "products": [], "updateReason": "external",
+                 "reasonMessage": "Kibo notification cancellation"}}
+
+   with the api_key header from GXO_API_CREDS, over the legacy-renegotiation TLS
+   context the endpoint requires, exactly as cancellation_api_sender_to_GXO.py does.
+
+   The payload fields come from the WLFS project:
+
+       SELECT o.logisticOrderNumber, o.shipmentOrderNumber, o.locationName,
+              o.brand, bc.brandCode
+       FROM `tlg-wlfs-prd`.til.prd_orders AS o
+       LEFT JOIN `tlg-wlfs-prd`.til.prd_brandConfig AS bc ON o.brand = bc.brand
+       WHERE o.locationName LIKE '%GX%'
+
+   read for the whole order (the LIKE pattern of step 5c) and matched to the cancel
+   target on the same key as everywhere else: logisticOrderNumber minus its first 2
+   characters == the Kibo shipmentNumber. The row describes the shipment GXO is holding,
+   so the shipmentOrderNumber and logisticOrderNumber sent to GXO are the target's own,
+   not those of the CANCELLED event that triggered the run.
+
+   No row for the target -> `no_warehouse_order_row`, and nothing is cancelled anywhere.
+   GXO refusing the POST -> `warehouse_cancel_failed`, and Kibo is left untouched.
+   --no-warehouse-cancel skips the whole step and cancels in Kibo only, as before.
 
 5a. Channel is NOT ecommerce  ->  cancel the shipment:
 
@@ -163,7 +201,12 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
+import ssl
+
 import requests
+import urllib3
+from requests.adapters import HTTPAdapter
+from urllib3.util.ssl_ import create_urllib3_context
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
@@ -178,6 +221,19 @@ BI_TABLE = "oms_active_shipments"
 WLFS_PROJECT = "tlg-wlfs-prd"
 WLFS_DATASET = "til"
 SHIPMENT_STATUS_TABLE = "prd_shipmentStatus"
+ORDERS_TABLE = "prd_orders"
+BRAND_CONFIG_TABLE = "prd_brandConfig"
+
+# The warehouse endpoint the cancellation is sent to before Kibo is touched, and the
+# fields of the CANCEL event, as in cancellation_api_sender_to_GXO.py.
+DEFAULT_GXO_URL = "https://prdedi.gxo.com:4084/sync/mft/tlg_it/shipmentStatusUpdate"
+GXO_EVENT_TYPE = "CANCEL"
+GXO_EVENT_CLASS = "SHIPMENT"
+GXO_UPDATE_REASON = "external"
+GXO_REASON_MESSAGE = "Kibo notification cancellation"
+# OP_LEGACY_SERVER_CONNECT: the endpoint negotiates in a way OpenSSL 3 refuses by
+# default. Numeric so it works on Python < 3.12 as well.
+SSL_OP_LEGACY_SERVER_CONNECT = 0x4
 
 DEFAULT_HOST = "tp3.mozu.com"
 DEFAULT_AUTH_URL = "https://home.mozu.com/api/platform/applications/authtickets/oauth"
@@ -223,8 +279,11 @@ ORDER_PATTERN_WILDCARD = "%"
 ORDER_PATTERN_POSITION = 6
 
 # The 6th character of the shipmentOrderNumber (counting the hyphen, so the 'E' of
-# "DJ-USE00041696") has to be one of these, or the shipment is left alone entirely.
-DEFAULT_ALLOWED_SIXTH_CHARACTERS = "ABCD"
+# "DJ-USE00041696") is the generation letter. It is reported and used to identify the
+# order, but it no longer restricts the run: every letter is in scope, so that the
+# repeat-cancellation rule of step 5c can still see an order that has been recycled
+# past D. Narrow a single run with --allowed-sixth-characters if ever needed.
+DEFAULT_ALLOWED_SIXTH_CHARACTERS = ""
 
 RESOLUTION_CANCEL = "cancel"
 RESOLUTION_REASSIGN = "reassign"
@@ -255,6 +314,23 @@ DEFAULT_CANCEL_TARGET_EXCLUDED_STATUSES = ""
 ON_MULTIPLE_SKIP = "skip"
 ON_MULTIPLE_NEWEST = "newest"
 DEFAULT_ON_MULTIPLE_CANCEL_TARGETS = ON_MULTIPLE_SKIP
+
+# The cancel target is the shipment the warehouse is actually holding: READY, in a GXO
+# location, with the products of the CANCELLED event.
+DEFAULT_CANCEL_TARGET_STATUS = "READY"
+DEFAULT_CANCEL_TARGET_LOCATION_PATTERN = "%GX%"
+
+# What to do when no shipment of the order matches. 'skip' leaves the row alone, which
+# is the safe reading now that a cancellation also goes to the warehouse: cancelling the
+# shipment the event names would tell GXO about a shipment it no longer holds.
+ON_NO_TARGET_SKIP = "skip"
+ON_NO_TARGET_EVENT = "event"
+DEFAULT_ON_NO_CANCEL_TARGET = ON_NO_TARGET_SKIP
+
+# Where the fulfilment location sits on a Kibo shipment.
+FULFILLMENT_LOCATION_KEYS = (
+    "fulfillmentLocationCode", "fulfillmentLocation", "locationCode", "locationName",
+)
 
 # GET /api/commerce/shipments?filter=externalOrderId=={id}
 # The Shipment API has its own filter syntax: `field==value`, clauses joined by ';'.
@@ -420,6 +496,22 @@ def matches_order_pattern(shipment_order_number: str, pattern: str) -> bool:
     return re.fullmatch(regex, clean(shipment_order_number)) is not None
 
 
+def matches_like(value: str, pattern: str) -> bool:
+    """
+    `value LIKE pattern`, case-insensitively, for patterns such as '%GX%'.
+
+    An empty pattern matches everything, so the check can be switched off by passing
+    an empty --cancel-target-location-pattern.
+    """
+    if not pattern:
+        return True
+    regex = "".join(
+        ".*" if part == "%" else "." if part == "_" else re.escape(part)
+        for part in pattern
+    )
+    return re.fullmatch(regex, clean(value), flags=re.IGNORECASE) is not None
+
+
 def products_of(payload: Dict[str, Any], product_keys: Sequence[str]) -> frozenset[str]:
     """
     Every product identifier carried by a payload, anywhere in the nesting.
@@ -468,6 +560,37 @@ def is_cancellable_status(status: str, excluded: Sequence[str] = ()) -> bool:
     if normalized in UNCANCELLABLE_STATUSES:
         return False
     return normalized not in {clean(s).upper().replace(" ", "").replace("-", "_") for s in excluded}
+
+
+def normalize_status(status: str) -> str:
+    return clean(status).upper().replace(" ", "").replace("-", "_")
+
+
+def is_wanted_status(status: str, wanted: str) -> bool:
+    """Whether a shipment carries the status the cancel target must have."""
+    if not wanted:
+        return True
+    return normalize_status(status) == normalize_status(wanted)
+
+
+def shipment_fulfillment_location(shipment: Dict[str, Any]) -> str:
+    """
+    The shipment's fulfilment location code, at the top level or nested.
+
+    Kibo names it fulfillmentLocationCode on the shipment, but the same value turns up
+    as locationCode on items and in some payload shapes, so every known spelling is
+    searched, the top level first.
+    """
+    for key in FULFILLMENT_LOCATION_KEYS:
+        value = clean(shipment.get(key))
+        if value:
+            return value
+    for key in FULFILLMENT_LOCATION_KEYS:
+        for value in iter_values(shipment, key):
+            text = clean(value)
+            if text:
+                return text
+    return ""
 
 
 def external_order_id_from_shipment_order_number(shipment_order_number: str) -> str:
@@ -761,6 +884,14 @@ class Candidate:
     order_shipments: str = ""
     cancel_target_candidates: str = ""
     cancel_target_source: str = ""
+    cancel_target_location: str = ""
+    warehouse_shipment_order_number: str = ""
+    warehouse_logistic_order_number: str = ""
+    warehouse_location_code: str = ""
+    warehouse_brand_code: str = ""
+    warehouse_event_id: str = ""
+    warehouse_action: str = ""
+    warehouse_response: str = ""
     reason_code: str = ""
     kibo_status_before: str = ""
     kibo_status_after: str = ""
@@ -1004,6 +1135,89 @@ def fetch_cancelled_order_shipments(
     return found
 
 
+@dataclass
+class WarehouseOrder:
+    """One prd_orders row for a shipment GXO is holding."""
+    shipment_order_number: str = ""
+    logistic_order_number: str = ""
+    location_name: str = ""
+    brand: str = ""
+    brand_code: str = ""
+
+
+def fetch_warehouse_orders(
+    client: bigquery.Client,
+    order_patterns: Sequence[str],
+    location_pattern: str,
+    pattern_batch_size: int,
+) -> Dict[str, WarehouseOrder]:
+    """
+    Return {kiboShipmentNumber: WarehouseOrder} for the GXO shipments of these orders.
+
+    Same query as cancellation_api_sender_to_GXO.fetch_order_data, with two changes:
+    the shipmentOrderNumbers come from the order LIKE patterns rather than an Excel
+    column, and they are parameterised instead of interpolated into the SQL.
+
+        SELECT o.logisticOrderNumber, o.shipmentOrderNumber, o.locationName,
+               o.brand, bc.brandCode
+        FROM `tlg-wlfs-prd`.til.prd_orders AS o
+        LEFT JOIN `tlg-wlfs-prd`.til.prd_brandConfig AS bc ON o.brand = bc.brand
+        WHERE o.locationName LIKE '%GX%'
+
+    The rows are keyed by the Kibo shipmentNumber, i.e. logisticOrderNumber minus its
+    first 2 characters, which is the same mapping the rest of this script and
+    fulfill_gxo_shipments.py use. That is what lets a cancel target resolved against
+    Kibo be matched to the warehouse row describing the very same shipment, instead of
+    assuming it is the one the CANCELLED event named.
+    """
+    orders_table = f"`{WLFS_PROJECT}.{WLFS_DATASET}.{ORDERS_TABLE}`"
+    brand_table = f"`{WLFS_PROJECT}.{WLFS_DATASET}.{BRAND_CONFIG_TABLE}`"
+    sql = f"""
+        SELECT
+            CAST(o.logisticOrderNumber AS STRING) AS logistic_order_number,
+            CAST(o.shipmentOrderNumber AS STRING) AS shipment_order_number,
+            CAST(o.locationName        AS STRING) AS location_name,
+            CAST(o.brand               AS STRING) AS brand,
+            CAST(bc.brandCode          AS STRING) AS brand_code
+        FROM {orders_table} AS o
+        LEFT JOIN {brand_table} AS bc
+            ON o.brand = bc.brand
+        WHERE (@location_pattern = '' OR o.locationName LIKE @location_pattern)
+          AND EXISTS (
+              SELECT 1 FROM UNNEST(@order_patterns) AS order_pattern
+              WHERE CAST(o.shipmentOrderNumber AS STRING) LIKE order_pattern
+          )
+    """
+
+    found: Dict[str, WarehouseOrder] = {}
+    for batch in chunked(list(order_patterns), max(1, pattern_batch_size)):
+        job = client.query(
+            sql,
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ArrayQueryParameter("order_patterns", "STRING", batch),
+                bigquery.ScalarQueryParameter(
+                    "location_pattern", "STRING", location_pattern or ""
+                ),
+            ]),
+        )
+        for row in job.result():
+            logistic = clean(row["logistic_order_number"])
+            number, error = kibo_number_from_logistic(logistic)
+            if error:
+                warn(f"{ORDERS_TABLE}: {error}")
+                continue
+            # A shipment can appear more than once; the rows carry the same identifiers,
+            # so the first one wins and the rest are ignored.
+            found.setdefault(number, WarehouseOrder(
+                shipment_order_number=clean(row["shipment_order_number"]),
+                logistic_order_number=logistic,
+                location_name=clean(row["location_name"]),
+                brand=clean(row["brand"]),
+                brand_code=clean(row["brand_code"]),
+            ))
+    return found
+
+
 def repeat_cancellation(
     candidate: Candidate,
     own_products: frozenset,
@@ -1033,6 +1247,7 @@ class CancelTarget:
     shipment: Optional[Dict[str, Any]] = None
     shipment_number: str = ""
     status: str = ""
+    location: str = ""
     source: str = ""
     considered: str = ""
     matches: List[str] = field(default_factory=list)
@@ -1042,7 +1257,9 @@ class CancelTarget:
 
 def describe_shipments(shipments: Sequence[Dict[str, Any]], limit: int = 12) -> str:
     parts = [
-        f"{shipment_number_of(s) or '?'}:{shipment_status(s) or '?'}" for s in shipments
+        f"{shipment_number_of(s) or '?'}:{shipment_status(s) or '?'}"
+        f"@{shipment_fulfillment_location(s) or '?'}"
+        for s in shipments
     ]
     if len(parts) > limit:
         return ", ".join(parts[:limit]) + f", +{len(parts) - limit} more"
@@ -1056,6 +1273,8 @@ def resolve_cancel_target(
     product_match: str,
     excluded_statuses: Sequence[str],
     on_multiple: str,
+    wanted_status: str = DEFAULT_CANCEL_TARGET_STATUS,
+    location_pattern: str = DEFAULT_CANCEL_TARGET_LOCATION_PATTERN,
 ) -> CancelTarget:
     """
     Pick, out of the shipments of one order, the one to cancel.
@@ -1065,18 +1284,27 @@ def resolve_cancel_target(
     REASSIGNED and will not accept a cancellation, while its replacement, under a new
     shipmentNumber, will. The replacement is the shipment of the same order that
 
+      - has shipmentStatus READY (`wanted_status`, empty to accept any cancellable one)
+      - sits in a GXO location: fulfillmentLocationCode LIKE '%GX%'
+        (`location_pattern`, empty to drop the check)
       - is in a cancellable status: not already CANCELED or otherwise terminal, and not
-        REASSIGNED, which Kibo refuses too (plus any status named in the excluded list,
-        empty by default)
+        REASSIGNED, which Kibo refuses too (plus any status named in the excluded list)
       - carries the exact same products as the CANCELLED event
 
+    READY and the GX location are what make the target the shipment the warehouse is
+    actually holding, which is the one the CANCEL event is sent to GXO for. Without
+    them a BACKORDER replacement, or a READY one that routing has already sent to a
+    different 3PL, would be cancelled and GXO told about a shipment it never had.
+
     Returns a CancelTarget: `shipment_number` empty with `ambiguous` False means nothing
-    matched and the caller should fall back to the shipment the event names.
+    matched, and what the caller does then is --on-no-cancel-target.
     """
     target = CancelTarget(considered=describe_shipments(shipments))
     cancellable = [
         shipment for shipment in shipments
         if is_cancellable_status(shipment_status(shipment), excluded_statuses)
+        and is_wanted_status(shipment_status(shipment), wanted_status)
+        and matches_like(shipment_fulfillment_location(shipment), location_pattern)
     ]
     matched = [
         shipment for shipment in cancellable
@@ -1100,6 +1328,7 @@ def resolve_cancel_target(
     target.shipment = matched[0]
     target.shipment_number = shipment_number_of(matched[0])
     target.status = shipment_status(matched[0])
+    target.location = shipment_fulfillment_location(matched[0])
     target.source = "order lookup"
     if not target.shipment_number:
         target.shipment = None
@@ -1330,6 +1559,93 @@ class KiboClient:
         return ok, "" if ok else f"HTTP {response.status_code}", excerpt_of(response)
 
 
+class LegacyTLSAdapter(HTTPAdapter):
+    """
+    The GXO endpoint needs legacy SSL renegotiation, which OpenSSL 3 refuses by default.
+
+    Same adapter as cancellation_api_sender_to_GXO.send_cancel_event, lifted out of the
+    request function so the context and the pool are built once per run instead of once
+    per shipment.
+    """
+
+    def init_poolmanager(self, *args: Any, **kwargs: Any) -> Any:
+        context = create_urllib3_context()
+        context.options |= SSL_OP_LEGACY_SERVER_CONNECT
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        kwargs["ssl_context"] = context
+        return super().init_poolmanager(*args, **kwargs)
+
+
+class GxoClient:
+    """Sends the CANCEL event that tells the warehouse to stop working a shipment."""
+
+    def __init__(self, api_key: str, url: str, timeout: float) -> None:
+        self.api_key = api_key
+        self.url = url
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.mount("https://", LegacyTLSAdapter())
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    @staticmethod
+    def build_payload(order: WarehouseOrder, event_id: str) -> Dict[str, Any]:
+        """
+        The CANCEL event, field for field as cancellation_api_sender_to_GXO builds it.
+
+        `products` stays empty: the event cancels the whole shipment, and GXO reads the
+        lines from the order it already holds. locationName is sent as locationCode.
+        """
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        return {
+            "eventType": GXO_EVENT_TYPE,
+            "eventClass": GXO_EVENT_CLASS,
+            "eventId": event_id,
+            "eventTimestamp": timestamp,
+            "data": {
+                "shipmentOrderNumber": order.shipment_order_number,
+                "logisticOrderNumber": order.logistic_order_number,
+                "locationCode": order.location_name,
+                "brandCode": order.brand_code,
+                "brand": order.brand,
+                "products": [],
+                "updateReason": GXO_UPDATE_REASON,
+                "reasonMessage": GXO_REASON_MESSAGE,
+            },
+        }
+
+    def send_cancel(
+        self, order: WarehouseOrder, event_id: str, max_retries: int,
+    ) -> Tuple[bool, str, str]:
+        """Returns (ok, error, response excerpt)."""
+        payload = self.build_payload(order, event_id)
+        headers = {"Content-Type": "application/json", "api_key": self.api_key}
+        last_error = ""
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = self.session.post(
+                    self.url, headers=headers, json=payload,
+                    timeout=self.timeout, verify=False,
+                )
+            except requests.RequestException as exc:
+                last_error = str(exc)
+                if attempt < max_retries:
+                    time.sleep(retry_sleep_seconds(attempt))
+                    continue
+                return False, last_error, ""
+            if (response.status_code in RETRYABLE_STATUS_CODES
+                    and attempt < max_retries):
+                time.sleep(retry_sleep_seconds(attempt, response))
+                continue
+            ok = 200 <= response.status_code < 300
+            return (
+                ok,
+                "" if ok else f"HTTP {response.status_code}",
+                excerpt_of(response),
+            )
+        return False, last_error or "Unknown error", ""
+
+
 def shipment_channel(shipment: Dict[str, Any]) -> str:
     """The shipment's channel as Kibo reports it."""
     for key in ("channel", "channelName", "salesChannel"):
@@ -1396,7 +1712,10 @@ CSV_FIELDS = [
     "resolution", "resolution_source", "has_cancelled_event", "has_picked_event", "picked_quantity",
     "logistic_order_number", "kibo_shipment_number", "number_matches_oms",
     "external_order_id", "event_shipment_number", "order_shipments",
-    "cancel_target_candidates", "cancel_target_source", "reason_code",
+    "cancel_target_candidates", "cancel_target_source", "cancel_target_location",
+    "warehouse_shipment_order_number", "warehouse_logistic_order_number",
+    "warehouse_location_code", "warehouse_brand_code", "warehouse_event_id",
+    "warehouse_action", "warehouse_response", "reason_code",
     "kibo_status_before", "kibo_status_after", "kibo_reason_after",
     "action", "success", "error", "response_excerpt", "correlation_id",
 ]
@@ -1430,6 +1749,10 @@ def write_job_summary(candidates: List[Candidate], dry_run: bool) -> None:
         if c.event_shipment_number and c.kibo_shipment_number != c.event_shipment_number
     ]
     ambiguous = [c for c in candidates if c.action == "ambiguous_cancel_target"]
+    no_target = [c for c in candidates if c.action == "no_cancel_target"]
+    warehouse_sent = [c for c in candidates if c.warehouse_action == "sent"]
+    warehouse_failed = [c for c in candidates if c.action == "warehouse_cancel_failed"]
+    no_warehouse_row = [c for c in candidates if c.action == "no_warehouse_order_row"]
     lines = [
         "## Cancel cancelled shipments",
         "",
@@ -1445,6 +1768,10 @@ def write_job_summary(candidates: List[Candidate], dry_run: bool) -> None:
         f"often on the order): **{len(repeat)}**",
         f"- Cancelled on the order's replacement shipment rather than the one the event "
         f"names: **{len(retargeted)}**",
+        f"- CANCEL events accepted by the warehouse: **{len(warehouse_sent)}**",
+        f"- Left alone, the warehouse refused the CANCEL: **{len(warehouse_failed)}**",
+        f"- Left alone, no {ORDERS_TABLE} row for the cancel target: **{len(no_warehouse_row)}**",
+        f"- Left alone, no READY shipment of the order in a GXO location: **{len(no_target)}**",
         f"- Left alone, several cancellable shipments of the order match: **{len(ambiguous)}**",
         f"- Already in a terminal or reassigned status: **{len(already)}**",
         f"- Left alone, 6th character not allowed: **{len(excluded)}**",
@@ -1453,8 +1780,8 @@ def write_job_summary(candidates: List[Candidate], dry_run: bool) -> None:
     ]
     if eligible:
         lines += [
-            "| shipmentOrderNumber | tenant | site | shipmentNumber | channel | orderNumber | cancelled on order | resolution | picked qty | reason | recorded reason | before | after | action | error |",
-            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+            "| shipmentOrderNumber | tenant | site | shipmentNumber | location | channel | orderNumber | cancelled on order | resolution | picked qty | reason | recorded reason | warehouse | before | after | action | error |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         ]
         for c in eligible[:200]:
             lines.append(
@@ -1466,15 +1793,17 @@ def write_job_summary(candidates: List[Candidate], dry_run: bool) -> None:
                     else ""
                 )
                 + " | "
+                f"{c.cancel_target_location or c.warehouse_location_code or '-'} | "
                 f"{c.channel or '-'} | {c.order_pattern or '-'} | "
                 f"{c.cancelled_order_shipments or '-'} | "
                 f"{c.resolution or '-'}{' (repeat)' if c.repeat_cancel == 'yes' else ''} | "
                 f"{c.picked_quantity or '-'} | {c.reason_code or '-'} | {c.kibo_reason_after or '-'} | "
+                f"{c.warehouse_action or '-'} | "
                 f"{c.kibo_status_before or '-'} | "
                 f"{c.kibo_status_after or '-'} | {c.action} | {c.error[:120]} |"
             )
         if len(eligible) > 200:
-            lines.append(f"| ... | | | | | | | | | | | | | | {len(eligible) - 200} more rows in the CSV artifact |")
+            lines.append(f"| ... | | | | | | | | | | | | | | | | {len(eligible) - 200} more rows in the CSV artifact |")
     with open(summary_path, "a", encoding="utf-8") as handle:
         handle.write("\n".join(lines) + "\n")
 
@@ -1525,6 +1854,32 @@ def parse_args() -> argparse.Namespace:
                              "of CANCELED and the other terminal ones and REASSIGNED, which Kibo "
                              "refuses anyway. Comma separated, empty by default: every "
                              "cancellable status is a valid target.")
+    parser.add_argument("--cancel-target-status", default=DEFAULT_CANCEL_TARGET_STATUS,
+                        help="The shipment of the order chosen as the cancel target must "
+                             "carry this shipmentStatus. Default READY: that is the "
+                             "shipment the warehouse is holding and the one the CANCEL "
+                             "event is sent to GXO for. Pass an empty string to accept "
+                             "any cancellable status.")
+    parser.add_argument("--cancel-target-location-pattern",
+                        default=DEFAULT_CANCEL_TARGET_LOCATION_PATTERN,
+                        help="The cancel target's fulfillmentLocationCode must match this "
+                             "SQL-style LIKE pattern, case-insensitively. Default '%%GX%%', "
+                             "so only shipments sitting in a GXO location are cancelled. "
+                             "Pass an empty string to drop the check.")
+    parser.add_argument("--on-no-cancel-target", default=DEFAULT_ON_NO_CANCEL_TARGET,
+                        choices=(ON_NO_TARGET_SKIP, ON_NO_TARGET_EVENT),
+                        help="What to do when no shipment of the order is READY in a GXO "
+                             "location with the same products: 'skip' reports the row as "
+                             "no_cancel_target and touches nothing, 'event' falls back to "
+                             "the shipmentNumber the CANCELLED event names, as before.")
+    parser.add_argument("--no-warehouse-cancel", dest="warehouse_cancel",
+                        action="store_false",
+                        help="Do not send the CANCEL event to GXO; cancel in Kibo only. "
+                             "By default the warehouse is told first and Kibo is only "
+                             "cancelled once GXO has accepted.")
+    parser.set_defaults(warehouse_cancel=True)
+    parser.add_argument("--gxo-url", default=DEFAULT_GXO_URL,
+                        help="Warehouse endpoint the CANCEL event is POSTed to.")
     parser.add_argument("--on-multiple-cancel-targets", default=DEFAULT_ON_MULTIPLE_CANCEL_TARGETS,
                         choices=(ON_MULTIPLE_SKIP, ON_MULTIPLE_NEWEST),
                         help="What to do when several shipments of the order are cancellable and "
@@ -1546,9 +1901,11 @@ def parse_args() -> argparse.Namespace:
                              "auto reassigned, however often the order has been cancelled before.")
     parser.set_defaults(repeat_cancel=True)
     parser.add_argument("--allowed-sixth-characters", default=DEFAULT_ALLOWED_SIXTH_CHARACTERS,
-                        help="Only act on a shipment whose shipmentOrderNumber has one of these as its "
-                             "6th character (the 'E' of DJ-USE00041696). Case-insensitive. "
-                             "Pass an empty string to act on every shipment.")
+                        help="Optional filter: only act on a shipment whose shipmentOrderNumber has "
+                             "one of these as its 6th character, the generation letter (the 'E' of "
+                             "DJ-USE00041696). Case-insensitive. EMPTY BY DEFAULT, so every "
+                             "generation is in scope; an order recycled past D is still handled, "
+                             "and the repeat-cancellation rule decides when to stop reassigning it.")
     parser.add_argument("--host", default=DEFAULT_HOST, help="Kibo host suffix.")
     parser.add_argument("--auth-url", default=DEFAULT_AUTH_URL, help="Kibo OAuth URL.")
     parser.add_argument("--limit", type=int, default=0, help="Limit the number of active shipments (0 = no limit).")
@@ -1573,6 +1930,9 @@ def parse_args() -> argparse.Namespace:
         parser.error("--order-lookup-page-size must be at least 1.")
     args.oms_status = args.oms_status.strip()
     args.ecommerce_channel = args.ecommerce_channel.strip()
+    args.cancel_target_status = args.cancel_target_status.strip()
+    args.cancel_target_location_pattern = args.cancel_target_location_pattern.strip()
+    args.gxo_url = args.gxo_url.strip()
     args.cancel_target_excluded_statuses = tuple(
         status.upper()
         for status in re.split(r"[,\s;]+", args.cancel_target_excluded_statuses.strip())
@@ -1632,19 +1992,30 @@ def main() -> int:
     if args.resolve_cancel_target:
         log(
             "Cancellations target the shipment of the order found with GET "
-            "/api/commerce/shipments?filter=externalOrderId==...: cancellable status"
+            "/api/commerce/shipments?filter=externalOrderId==...: "
+            + (f"shipmentStatus {args.cancel_target_status}" if args.cancel_target_status
+               else "any cancellable status")
             + (
-                " (never CANCELED, another terminal status, REASSIGNED"
-                + (
-                    f" or {', '.join(args.cancel_target_excluded_statuses)})"
-                    if args.cancel_target_excluded_statuses else ")"
-                )
+                f", fulfillmentLocationCode LIKE '{args.cancel_target_location_pattern}'"
+                if args.cancel_target_location_pattern else ", any location"
+            )
+            + (
+                f", never {', '.join(args.cancel_target_excluded_statuses)}"
+                if args.cancel_target_excluded_statuses else ""
             )
             + f", same products (--product-match {args.product_match}), "
-            f"on several matches: {args.on_multiple_cancel_targets}."
+            f"on several matches: {args.on_multiple_cancel_targets}, "
+            f"on no match: {args.on_no_cancel_target}."
         )
     else:
         log("Cancellations target the shipmentNumber the CANCELLED event names.")
+    if args.warehouse_cancel:
+        log(
+            f"A CANCEL event is sent to the warehouse first ({args.gxo_url}); "
+            "Kibo is only cancelled once GXO accepts it."
+        )
+    else:
+        log("Warehouse cancellation disabled: Kibo is cancelled without telling GXO.")
     log(f"Kibo host: {args.host}")
 
     kibo_credentials = load_json_env("KIBO_API_CREDS")
@@ -1652,6 +2023,12 @@ def main() -> int:
     client_secret = clean(kibo_credentials.get("client_secret"))
     if not client_id or not client_secret:
         fail("KIBO_API_CREDS must contain non-empty 'client_id' and 'client_secret'.")
+
+    gxo_api_key = ""
+    if args.warehouse_cancel:
+        gxo_api_key = clean(load_json_env("GXO_API_CREDS").get("api_key"))
+        if not gxo_api_key:
+            fail("GXO_API_CREDS must contain a non-empty 'api_key'.")
 
     bi_client = bigquery_client("BI_BIGQUERY_CREDS", BI_PROJECT)
     wlfs_client = bigquery_client("TIL_BIGQUERY_CREDS", WLFS_PROJECT)
@@ -1691,6 +2068,7 @@ def main() -> int:
 
     kibo = KiboClient({"client_id": client_id, "client_secret": client_secret},
                       args.auth_url, args.host, args.timeout)
+    gxo = GxoClient(gxo_api_key, args.gxo_url, args.timeout) if args.warehouse_cancel else None
 
     rows: List[Candidate] = []
     eligible: List[Candidate] = []
@@ -1851,6 +2229,27 @@ def main() -> int:
                 "repeat-cancellation rule cannot be applied to them."
             )
 
+    # The CANCEL event sent to GXO needs the shipment's logisticOrderNumber, location
+    # and brand. They come from prd_orders, read once for every order in the run and
+    # keyed by Kibo shipmentNumber so the cancel target resolved in step 4b can be
+    # matched to the warehouse row describing that same shipment.
+    warehouse_orders: Dict[str, WarehouseOrder] = {}
+    if args.warehouse_cancel and eligible:
+        order_patterns = sorted({c.order_pattern for c in eligible if c.order_pattern})
+        if order_patterns:
+            warehouse_orders = fetch_warehouse_orders(
+                wlfs_client, order_patterns, args.cancel_target_location_pattern,
+                args.pattern_batch_size,
+            )
+            log(
+                f"Warehouse rows read from {ORDERS_TABLE}"
+                + (
+                    f" with locationName LIKE '{args.cancel_target_location_pattern}'"
+                    if args.cancel_target_location_pattern else ""
+                )
+                + f": {len(warehouse_orders)}"
+            )
+
     for index, candidate in enumerate(eligible, start=1):
         candidate.correlation_id = uuid.uuid4().hex
         log(
@@ -1968,6 +2367,8 @@ def main() -> int:
                     args.product_match,
                     args.cancel_target_excluded_statuses,
                     args.on_multiple_cancel_targets,
+                    args.cancel_target_status,
+                    args.cancel_target_location_pattern,
                 )
                 candidate.order_shipments = target.considered
                 candidate.cancel_target_candidates = ", ".join(target.matches)
@@ -1980,10 +2381,12 @@ def main() -> int:
 
                 if target.shipment_number:
                     candidate.cancel_target_source = target.source
+                    candidate.cancel_target_location = target.location
                     if target.shipment_number != candidate.kibo_shipment_number:
                         log(
                             f"    order {candidate.external_order_id}: cancelling "
-                            f"{target.shipment_number} ({target.status or 'unknown'}) "
+                            f"{target.shipment_number} ({target.status or 'unknown'} "
+                            f"@ {target.location or 'unknown'}) "
                             f"instead of {candidate.kibo_shipment_number} "
                             f"({candidate.kibo_status_before or 'unknown'})"
                         )
@@ -1991,6 +2394,23 @@ def main() -> int:
                     candidate.kibo_status_before = target.status
                     candidate.kibo_status_after = target.status
                     shipment = target.shipment or shipment
+                elif args.on_no_cancel_target == ON_NO_TARGET_SKIP:
+                    # Nothing of this order is READY in a GXO location with these
+                    # products, so there is no shipment for the warehouse to cancel.
+                    # Cancelling the one the event names would tell GXO about a
+                    # shipment it no longer holds.
+                    candidate.action = "no_cancel_target"
+                    candidate.error = target.error or (
+                        f"No shipment of order {candidate.external_order_id} is "
+                        + (f"{args.cancel_target_status} " if args.cancel_target_status else "cancellable ")
+                        + (
+                            f"in a location matching '{args.cancel_target_location_pattern}' "
+                            if args.cancel_target_location_pattern else ""
+                        )
+                        + f"with the same products ({target.considered or 'none returned'})."
+                    )
+                    warn(f"    {candidate.error}")
+                    continue
                 else:
                     candidate.cancel_target_source = "event (no match on the order)"
                     if target.error:
@@ -2014,6 +2434,31 @@ def main() -> int:
             log(f"    already {candidate.kibo_status_before}, nothing to reassign.")
             continue
 
+        # A cancellation goes to the warehouse before Kibo, so the row describing the
+        # cancel target in prd_orders has to exist. It is looked up by the target's own
+        # shipmentNumber, not by the one the CANCELLED event named: after step 4b those
+        # are usually two different shipments, and GXO is holding the target.
+        warehouse_order: Optional[WarehouseOrder] = None
+        if candidate.resolution == RESOLUTION_CANCEL and args.warehouse_cancel:
+            warehouse_order = warehouse_orders.get(candidate.kibo_shipment_number)
+            if warehouse_order is None:
+                candidate.action = "no_warehouse_order_row"
+                candidate.error = (
+                    f"No {ORDERS_TABLE} row for shipmentNumber "
+                    f"{candidate.kibo_shipment_number}"
+                    + (
+                        f" with locationName LIKE '{args.cancel_target_location_pattern}'"
+                        if args.cancel_target_location_pattern else ""
+                    )
+                    + ": the CANCEL event cannot be built, so nothing was cancelled."
+                )
+                warn(f"    {candidate.error}")
+                continue
+            candidate.warehouse_shipment_order_number = warehouse_order.shipment_order_number
+            candidate.warehouse_logistic_order_number = warehouse_order.logistic_order_number
+            candidate.warehouse_location_code = warehouse_order.location_name
+            candidate.warehouse_brand_code = warehouse_order.brand_code
+
         if args.dry_run:
             candidate.action = (
                 "would_reassign" if candidate.resolution == RESOLUTION_REASSIGN else "would_cancel"
@@ -2022,8 +2467,16 @@ def main() -> int:
             candidate.response_excerpt = (
                 "DRY RUN - the reassigned endpoint was not called"
                 if candidate.resolution == RESOLUTION_REASSIGN
-                else "DRY RUN - the canceled endpoint was not called"
+                else "DRY RUN - neither GXO nor the canceled endpoint was called"
             )
+            if warehouse_order is not None:
+                candidate.warehouse_action = "would_send"
+                log(
+                    f"    DRY RUN would send CANCEL to GXO for "
+                    f"{warehouse_order.shipment_order_number} / "
+                    f"{warehouse_order.logistic_order_number} @ "
+                    f"{warehouse_order.location_name}"
+                )
             log(f"    DRY RUN status={candidate.kibo_status_before or 'unknown'} reason={candidate.reason_code}")
             continue
 
@@ -2036,12 +2489,51 @@ def main() -> int:
             candidate.action = "reassigned" if ok else "reassign_failed"
             candidate.error = "" if ok else f"PUT /reassigned failed: {error}"
         else:
+            # The warehouse is told first: Kibo is only cancelled once GXO has accepted
+            # the CANCEL event, so the two systems cannot end up disagreeing about a
+            # shipment that is still being worked on the floor.
+            if warehouse_order is not None and gxo is not None:
+                candidate.warehouse_event_id = str(uuid.uuid4()).upper()
+                sent, gxo_error, gxo_excerpt = gxo.send_cancel(
+                    warehouse_order, candidate.warehouse_event_id, args.max_retries,
+                )
+                candidate.warehouse_response = gxo_excerpt
+                candidate.warehouse_action = "sent" if sent else "failed"
+                if not sent:
+                    candidate.action = "warehouse_cancel_failed"
+                    candidate.error = (
+                        f"POST to GXO failed for "
+                        f"{warehouse_order.shipment_order_number} / "
+                        f"{warehouse_order.logistic_order_number}: {gxo_error}. "
+                        "Kibo was left untouched."
+                    )
+                    candidate.success = False
+                    warn(f"    {candidate.error}")
+                    if gxo_excerpt:
+                        warn(f"    response: {gxo_excerpt[:400]}")
+                    if args.sleep_between_requests > 0:
+                        time.sleep(args.sleep_between_requests)
+                    continue
+                log(
+                    f"    CANCEL sent to GXO for "
+                    f"{warehouse_order.shipment_order_number} / "
+                    f"{warehouse_order.logistic_order_number} @ "
+                    f"{warehouse_order.location_name}"
+                )
+
             ok, error, excerpt = kibo.mark_canceled(
                 candidate.tenant_id, candidate.site_id, candidate.kibo_shipment_number,
                 candidate.reason_code, args.max_retries, candidate.correlation_id,
             )
             candidate.action = "canceled" if ok else "cancel_failed"
-            candidate.error = "" if ok else f"PUT /canceled failed: {error}"
+            candidate.error = "" if ok else (
+                f"PUT /canceled failed: {error}"
+                + (
+                    " — the warehouse CANCEL was already sent, so GXO and Kibo now "
+                    "disagree and the shipment has to be cancelled in Kibo by hand."
+                    if candidate.warehouse_action == "sent" else ""
+                )
+            )
         candidate.success = ok
         candidate.response_excerpt = excerpt
 
@@ -2086,8 +2578,12 @@ def main() -> int:
         f"(of which {sum(1 for c in eligible if c.repeat_cancel == 'yes')} ecommerce on the "
         f"repeat-cancellation rule), "
         f"{sum(1 for c in eligible if c.action == 'reassigned' and c.success)} auto reassigned, "
+        f"{sum(1 for c in eligible if c.warehouse_action == 'sent')} CANCEL events sent to "
+        f"the warehouse, "
+        f"{sum(1 for c in eligible if c.action == 'no_cancel_target')} with no READY GXO "
+        f"shipment on the order, "
         f"{sum(1 for c in rows if c.action == 'sixth_character_excluded')} left alone on the "
-        f"6th character rule, {len(failures)} failed."
+        f"6th character filter, {len(failures)} failed."
     )
     return 0 if not failures else 2
 
