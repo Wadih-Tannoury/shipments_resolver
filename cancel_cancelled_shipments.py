@@ -47,7 +47,37 @@ Pipeline
 
    The GET is a safety net: a shipment that Kibo already reports as cancelled, closed
    or otherwise terminal is reported as `already_terminal` and left alone. It also
-   supplies the shipment's `channel`, which decides what happens next.
+   supplies the shipment's `channel` and `externalOrderId`.
+
+4b. Whenever the outcome is a cancellation, the shipment that actually gets cancelled is
+   resolved against the order rather than assumed to be the one the event names.
+
+   Kibo auto reassigns a shipment as soon as the warehouse cancels it: the shipment the
+   CANCELLED event points at is already REASSIGNED by the time this job runs, and a
+   REASSIGNED shipment cannot be cancelled. The replacement shipment, under a new
+   shipmentNumber, is the one to cancel.
+
+       GET https://t{tenantId}.{host}/api/commerce/shipments?filter=externalOrderId=={id}
+
+   The externalOrderId is the shipment's own field, falling back to the
+   shipmentOrderNumber with its 6th character — the generation letter — put back to a
+   hyphen ("DJ-USAST0000124550" -> "DJ-US-ST0000124550"), the inverse of what
+   release_held_exchange_shipments.py does.
+
+   Out of the shipments of that order, the target is the one that
+
+     - is in a cancellable status: not already CANCELED, nor any other terminal status
+       (CLOSED, SHIPPED, ...), nor REASSIGNED, which Kibo refuses as well. Statuses can
+       be excluded on top of those with --cancel-target-excluded-statuses, empty by
+       default: READY, BACKORDER and the rest are all valid targets.
+     - carries the exact same products as the CANCELLED event: every product of the
+       event is on the shipment and every item of the shipment is in the event.
+       --product-match overlap only asks for one product in common, any skips the check
+
+   When nothing matches, the shipment named by the event is cancelled as before. When
+   several match, the row is reported as `ambiguous_cancel_target` and left alone;
+   --on-multiple-cancel-targets newest takes the most recent one instead. The whole
+   step is skipped with --no-resolve-cancel-target.
 
 5a. Channel is NOT ecommerce  ->  cancel the shipment:
 
@@ -208,6 +238,43 @@ TERMINAL_STATUSES = {
 # Statuses that mean the shipment has already left the fulfilment location, so there is
 # nothing to auto reassign: it is already back with routing or already in backorder.
 ALREADY_REASSIGNED_STATUSES = {"REASSIGNED", "BACKORDER", "BACK_ORDER", "BACKORDERED"}
+
+# Statuses Kibo will not accept a cancellation for. REASSIGNED is the one this whole
+# step exists for: the shipment the CANCELLED event names has already been handed back
+# to routing, so it is the replacement shipment that has to be cancelled. BACKORDER is
+# deliberately NOT here — a backordered shipment is cancellable, and is very often
+# exactly where the replacement lands.
+UNCANCELLABLE_STATUSES = TERMINAL_STATUSES | {"REASSIGNED"}
+
+# Statuses excluded from the cancel-target search on top of UNCANCELLABLE_STATUSES.
+# Empty by default: the rule is "not already CANCELED", which UNCANCELLABLE_STATUSES
+# already covers along with the other terminal statuses and REASSIGNED, so a READY
+# replacement is a perfectly good target.
+DEFAULT_CANCEL_TARGET_EXCLUDED_STATUSES = ""
+
+ON_MULTIPLE_SKIP = "skip"
+ON_MULTIPLE_NEWEST = "newest"
+DEFAULT_ON_MULTIPLE_CANCEL_TARGETS = ON_MULTIPLE_SKIP
+
+# GET /api/commerce/shipments?filter=externalOrderId=={id}
+# The Shipment API has its own filter syntax: `field==value`, clauses joined by ';'.
+# Only the externalOrderId clause is sent and the statuses are filtered in Python, so
+# the query stays one simple, well documented expression.
+SHIPMENTS_FILTER_TEMPLATE = "externalOrderId=={value}"
+DEFAULT_ORDER_LOOKUP_PAGE_SIZE = 200
+
+EXTERNAL_ORDER_ID_KEYS = ("externalOrderId", "external_order_id")
+
+# The externalOrderId is the shipmentOrderNumber with the generation letter at position
+# 6 put back to a hyphen: "DJ-USAST0000124550" -> "DJ-US-ST0000124550".
+EXTERNAL_ORDER_ID_CHARACTER = "-"
+
+# Per-item product identifiers on a Kibo shipment item, matched against the product
+# identifiers of the CANCELLED requestPayload.
+SHIPMENT_ITEM_PRODUCT_KEYS = (
+    "upc", "sku", "productCode", "variationProductCode", "itemCode", "partNumber",
+    "productId", "barcode", "ean", "styleCode",
+)
 
 # Candidate column names, resolved case-insensitively against the real schema.
 SHIPMENT_NUMBER_CANDIDATES = ("shipmentOrderNumber", "shipment_order_number")
@@ -386,6 +453,117 @@ def format_products(products: Iterable[str], limit: int = 8) -> str:
     if len(items) > limit:
         return ", ".join(items[:limit]) + f", +{len(items) - limit} more"
     return ", ".join(items)
+
+
+def is_cancellable_status(status: str, excluded: Sequence[str] = ()) -> bool:
+    """
+    Whether Kibo would accept a cancellation for a shipment in this status.
+
+    An empty status is treated as cancellable: Kibo is the one that decides, and a
+    shipment whose status could not be read should not be silently dropped.
+    """
+    normalized = status.upper().replace(" ", "").replace("-", "_")
+    if not normalized:
+        return True
+    if normalized in UNCANCELLABLE_STATUSES:
+        return False
+    return normalized not in {clean(s).upper().replace(" ", "").replace("-", "_") for s in excluded}
+
+
+def external_order_id_from_shipment_order_number(shipment_order_number: str) -> str:
+    """
+    The externalOrderId behind a shipmentOrderNumber.
+
+    The 6th character, counting every character including the hyphens, is the generation
+    letter (the A/B/C/D the sixth-character rule keys on) and the externalOrderId carries
+    a hyphen there instead:
+
+        DJ-USAST0000124550  ->  DJ-US-ST0000124550
+
+    which is the inverse of release_held_exchange_shipments.shipment_order_number_from.
+    Returns "" when the number is too short to have a 6th character.
+    """
+    value = clean(shipment_order_number)
+    if len(value) < ORDER_PATTERN_POSITION:
+        return ""
+    index = ORDER_PATTERN_POSITION - 1
+    return value[:index] + EXTERNAL_ORDER_ID_CHARACTER + value[index + 1:]
+
+
+def shipment_items_of(shipment: Dict[str, Any]) -> List[Any]:
+    for key in ("items", "shipmentItems", "lineItems"):
+        value = shipment.get(key)
+        if isinstance(value, list) and value:
+            return value
+    return []
+
+
+def item_products(item: Any, product_keys: Sequence[str]) -> frozenset[str]:
+    """Every product identifier carried by one shipment item, nesting included."""
+    if not isinstance(item, (dict, list)):
+        return frozenset()
+    products: set[str] = set()
+    for key in product_keys:
+        for value in iter_values(item, key):
+            text = clean(value).upper()
+            if text:
+                products.add(text)
+    return frozenset(products)
+
+
+def shipment_matches_products(
+    shipment: Dict[str, Any],
+    event_products: frozenset[str],
+    product_keys: Sequence[str],
+    mode: str,
+) -> Tuple[bool, frozenset[str]]:
+    """
+    Whether a Kibo shipment carries the same products as the CANCELLED event.
+
+    Identifiers are compared per item rather than as one flat set, because a Kibo item
+    names the same product several ways at once (productCode, variationProductCode, upc)
+    while the event payload usually names it once. Flat set equality would therefore
+    never hold. "The exact same products" is read as:
+
+        every product of the event is on some item of the shipment
+        and every item of the shipment carries a product of the event
+
+    so a shipment that also contains something the event did not cancel, or that is
+    missing one of the cancelled products, does not match.
+
+    Returns (matches, the shipment's product identifiers).
+    """
+    items = shipment_items_of(shipment)
+    per_item = [item_products(item, product_keys) for item in items]
+    all_products = frozenset().union(*per_item) if per_item else frozenset()
+
+    if mode == PRODUCT_MATCH_ANY:
+        return True, all_products
+    if not event_products or not per_item:
+        return False, all_products
+
+    covered = all_products & event_products
+    if mode == PRODUCT_MATCH_OVERLAP:
+        return bool(covered), all_products
+
+    every_event_product_shipped = covered == event_products
+    every_item_cancelled = all(products & event_products for products in per_item)
+    return bool(every_event_product_shipped and every_item_cancelled), all_products
+
+
+def shipment_created_at(shipment: Dict[str, Any]) -> str:
+    """The shipment's creation timestamp as a sortable string, or ""."""
+    audit = shipment.get("auditInfo")
+    if isinstance(audit, dict):
+        for key in ("createDate", "updateDate"):
+            value = clean(audit.get(key))
+            if value:
+                return value
+    for key in ("createDate", "orderSubmitDate", "shipmentCreateDate"):
+        value = clean(shipment.get(key))
+        if value:
+            return value
+    return ""
 
 
 def same_channel(value: str, wanted: str) -> bool:
@@ -578,6 +756,11 @@ class Candidate:
     logistic_order_number: str = ""
     kibo_shipment_number: str = ""
     number_matches_oms: str = ""
+    external_order_id: str = ""
+    event_shipment_number: str = ""
+    order_shipments: str = ""
+    cancel_target_candidates: str = ""
+    cancel_target_source: str = ""
     reason_code: str = ""
     kibo_status_before: str = ""
     kibo_status_after: str = ""
@@ -844,6 +1027,87 @@ def repeat_cancellation(
     return len(matched), sorted(matched)
 
 
+@dataclass
+class CancelTarget:
+    """The shipment of the order that should actually be cancelled."""
+    shipment: Optional[Dict[str, Any]] = None
+    shipment_number: str = ""
+    status: str = ""
+    source: str = ""
+    considered: str = ""
+    matches: List[str] = field(default_factory=list)
+    error: str = ""
+    ambiguous: bool = False
+
+
+def describe_shipments(shipments: Sequence[Dict[str, Any]], limit: int = 12) -> str:
+    parts = [
+        f"{shipment_number_of(s) or '?'}:{shipment_status(s) or '?'}" for s in shipments
+    ]
+    if len(parts) > limit:
+        return ", ".join(parts[:limit]) + f", +{len(parts) - limit} more"
+    return ", ".join(parts)
+
+
+def resolve_cancel_target(
+    shipments: Sequence[Dict[str, Any]],
+    event_products: frozenset,
+    product_keys: Sequence[str],
+    product_match: str,
+    excluded_statuses: Sequence[str],
+    on_multiple: str,
+) -> CancelTarget:
+    """
+    Pick, out of the shipments of one order, the one to cancel.
+
+    The CANCELLED event names the shipment the warehouse was working on, and Kibo has
+    already auto reassigned it by the time this job runs: that shipmentNumber is
+    REASSIGNED and will not accept a cancellation, while its replacement, under a new
+    shipmentNumber, will. The replacement is the shipment of the same order that
+
+      - is in a cancellable status: not already CANCELED or otherwise terminal, and not
+        REASSIGNED, which Kibo refuses too (plus any status named in the excluded list,
+        empty by default)
+      - carries the exact same products as the CANCELLED event
+
+    Returns a CancelTarget: `shipment_number` empty with `ambiguous` False means nothing
+    matched and the caller should fall back to the shipment the event names.
+    """
+    target = CancelTarget(considered=describe_shipments(shipments))
+    cancellable = [
+        shipment for shipment in shipments
+        if is_cancellable_status(shipment_status(shipment), excluded_statuses)
+    ]
+    matched = [
+        shipment for shipment in cancellable
+        if shipment_matches_products(shipment, event_products, product_keys, product_match)[0]
+    ]
+    target.matches = [shipment_number_of(s) for s in matched if shipment_number_of(s)]
+
+    if not matched:
+        return target
+    if len(matched) > 1:
+        if on_multiple != ON_MULTIPLE_NEWEST:
+            target.ambiguous = True
+            target.error = (
+                f"{len(matched)} shipments of the order are cancellable and carry the "
+                f"same products ({', '.join(target.matches)}); "
+                "--on-multiple-cancel-targets newest would take the most recent one."
+            )
+            return target
+        matched.sort(key=lambda s: (shipment_created_at(s), shipment_number_of(s)), reverse=True)
+
+    target.shipment = matched[0]
+    target.shipment_number = shipment_number_of(matched[0])
+    target.status = shipment_status(matched[0])
+    target.source = "order lookup"
+    if not target.shipment_number:
+        target.shipment = None
+        target.source = ""
+        target.error = "The matching shipment of the order carries no shipmentNumber."
+    return target
+
+
 # ---------------------------------------------------------------------------
 # Kibo client
 # ---------------------------------------------------------------------------
@@ -923,6 +1187,7 @@ class KiboClient:
         json_body: Optional[Dict[str, Any]] = None,
         max_retries: int = 3,
         correlation_id: str = "",
+        params: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Optional[Any], str]:
         last_error = ""
         last_response = None
@@ -933,6 +1198,7 @@ class KiboClient:
                     url,
                     headers=self.headers(tenant_id, site_id, correlation_id),
                     json=json_body,
+                    params=params,
                     timeout=self.timeout,
                 )
                 last_response = response
@@ -974,6 +1240,47 @@ class KiboClient:
             return response.json(), ""
         except ValueError:
             return None, "Shipment response was not JSON."
+
+    def shipments_url(self, tenant_id: str) -> str:
+        return f"https://t{tenant_id}.{self.host}/api/commerce/shipments"
+
+    def get_shipments_by_external_order_id(
+        self, tenant_id: str, site_id: str, external_order_id: str,
+        max_retries: int, page_size: int,
+    ) -> Tuple[List[Dict[str, Any]], str]:
+        """
+        Every shipment of one order.
+
+            GET /api/commerce/shipments?filter=externalOrderId=={externalOrderId}
+
+        The Shipment API has its own filter syntax — `field==value`, clauses joined by
+        ';' — unlike the `field eq value` of the other Kibo APIs. Only the
+        externalOrderId clause is sent; the statuses are filtered in Python so that one
+        response shows every sibling shipment, whatever its status, in the CSV.
+        """
+        response, error = self.request(
+            "GET", self.shipments_url(tenant_id), tenant_id, site_id,
+            max_retries=max_retries,
+            params={
+                "filter": SHIPMENTS_FILTER_TEMPLATE.format(value=external_order_id),
+                "pageSize": int(page_size),
+            },
+        )
+        if response is None:
+            return [], error
+        if not (200 <= response.status_code < 300):
+            return [], f"HTTP {response.status_code}: {excerpt_of(response, 300)}"
+        try:
+            payload = response.json()
+        except ValueError:
+            return [], "The shipments response was not JSON."
+        if isinstance(payload, list):
+            items = payload
+        elif isinstance(payload, dict):
+            items = payload.get("items") or payload.get("shipments") or []
+        else:
+            items = []
+        return [item for item in items if isinstance(item, dict)], ""
 
     def mark_canceled(
         self, tenant_id: str, site_id: str, shipment_number: str, reason: str,
@@ -1032,6 +1339,29 @@ def shipment_channel(shipment: Dict[str, Any]) -> str:
     return ""
 
 
+def shipment_external_order_id(shipment: Dict[str, Any]) -> str:
+    """The shipment's externalOrderId, at the top level or inside its `data` object."""
+    for key in EXTERNAL_ORDER_ID_KEYS:
+        value = clean(shipment.get(key))
+        if value:
+            return value
+    data = shipment.get("data")
+    if isinstance(data, dict):
+        for key in EXTERNAL_ORDER_ID_KEYS:
+            value = clean(data.get(key))
+            if value:
+                return value
+    return ""
+
+
+def shipment_number_of(shipment: Dict[str, Any]) -> str:
+    for key in ("shipmentNumber", "shipmentId", "number"):
+        value = clean(shipment.get(key))
+        if value:
+            return value
+    return ""
+
+
 def shipment_status_reason(shipment: Dict[str, Any]) -> str:
     """The reasonCode Kibo actually recorded, from shipmentStatusReason."""
     node = shipment.get("shipmentStatusReason")
@@ -1064,7 +1394,9 @@ CSV_FIELDS = [
     "order_pattern", "cancelled_products", "cancelled_order_shipments",
     "cancelled_order_shipment_numbers", "repeat_cancel",
     "resolution", "resolution_source", "has_cancelled_event", "has_picked_event", "picked_quantity",
-    "logistic_order_number", "kibo_shipment_number", "number_matches_oms", "reason_code",
+    "logistic_order_number", "kibo_shipment_number", "number_matches_oms",
+    "external_order_id", "event_shipment_number", "order_shipments",
+    "cancel_target_candidates", "cancel_target_source", "reason_code",
     "kibo_status_before", "kibo_status_after", "kibo_reason_after",
     "action", "success", "error", "response_excerpt", "correlation_id",
 ]
@@ -1093,6 +1425,11 @@ def write_job_summary(candidates: List[Candidate], dry_run: bool) -> None:
     no_inventory = [c for c in eligible if c.reason_code == REASON_NO_INVENTORY]
     backordered = [c for c in reassigned if is_already_reassigned_status(c.kibo_status_after)]
     repeat = [c for c in eligible if c.repeat_cancel == "yes"]
+    retargeted = [
+        c for c in eligible
+        if c.event_shipment_number and c.kibo_shipment_number != c.event_shipment_number
+    ]
+    ambiguous = [c for c in candidates if c.action == "ambiguous_cancel_target"]
     lines = [
         "## Cancel cancelled shipments",
         "",
@@ -1106,6 +1443,9 @@ def write_job_summary(candidates: List[Candidate], dry_run: bool) -> None:
         + (f", of which now backorder/reassigned: **{len(backordered)}**" if reassigned else ""),
         f"- Ecommerce cancelled instead of reassigned (same products cancelled too "
         f"often on the order): **{len(repeat)}**",
+        f"- Cancelled on the order's replacement shipment rather than the one the event "
+        f"names: **{len(retargeted)}**",
+        f"- Left alone, several cancellable shipments of the order match: **{len(ambiguous)}**",
         f"- Already in a terminal or reassigned status: **{len(already)}**",
         f"- Left alone, 6th character not allowed: **{len(excluded)}**",
         f"- With an error: **{len(failed)}**",
@@ -1118,7 +1458,14 @@ def write_job_summary(candidates: List[Candidate], dry_run: bool) -> None:
         ]
         for c in eligible[:200]:
             lines.append(
-                f"| {c.shipment_order_number} | {c.tenant_id} | {c.site_id} | {c.kibo_shipment_number} | "
+                f"| {c.shipment_order_number} | {c.tenant_id} | {c.site_id} | "
+                f"{c.kibo_shipment_number}"
+                + (
+                    f" (was {c.event_shipment_number})"
+                    if c.event_shipment_number and c.event_shipment_number != c.kibo_shipment_number
+                    else ""
+                )
+                + " | "
                 f"{c.channel or '-'} | {c.order_pattern or '-'} | "
                 f"{c.cancelled_order_shipments or '-'} | "
                 f"{c.resolution or '-'}{' (repeat)' if c.repeat_cancel == 'yes' else ''} | "
@@ -1165,6 +1512,28 @@ def parse_args() -> argparse.Namespace:
                         help="How 'the same products' is decided when counting the cancelled "
                              "shipmentOrderNumbers of an order: 'exact' needs identical product sets, "
                              "'overlap' at least one product in common, 'any' ignores products.")
+    parser.add_argument("--no-resolve-cancel-target", dest="resolve_cancel_target",
+                        action="store_false",
+                        help="Cancel the shipmentNumber the CANCELLED event names instead of "
+                             "looking the order up with getShipments by externalOrderId. Kibo "
+                             "auto reassigns a cancelled shipment, so that number is usually "
+                             "REASSIGNED and the cancellation is refused.")
+    parser.set_defaults(resolve_cancel_target=True)
+    parser.add_argument("--cancel-target-excluded-statuses",
+                        default=DEFAULT_CANCEL_TARGET_EXCLUDED_STATUSES,
+                        help="Extra shipment statuses never chosen as the cancel target, on top "
+                             "of CANCELED and the other terminal ones and REASSIGNED, which Kibo "
+                             "refuses anyway. Comma separated, empty by default: every "
+                             "cancellable status is a valid target.")
+    parser.add_argument("--on-multiple-cancel-targets", default=DEFAULT_ON_MULTIPLE_CANCEL_TARGETS,
+                        choices=(ON_MULTIPLE_SKIP, ON_MULTIPLE_NEWEST),
+                        help="What to do when several shipments of the order are cancellable and "
+                             "carry the same products: 'skip' reports the row as "
+                             "ambiguous_cancel_target and touches nothing, 'newest' cancels the "
+                             "most recently created one.")
+    parser.add_argument("--order-lookup-page-size", type=int, default=DEFAULT_ORDER_LOOKUP_PAGE_SIZE,
+                        help="pageSize sent with GET /api/commerce/shipments when reading the "
+                             "shipments of an order.")
     parser.add_argument("--product-keys", default=",".join(DEFAULT_PRODUCT_KEYS),
                         help="Comma separated payload keys read as product identifiers, looked for "
                              "anywhere in the CANCELLED requestPayload.")
@@ -1200,8 +1569,15 @@ def parse_args() -> argparse.Namespace:
         parser.error("--pattern-batch-size must be at least 1.")
     if args.max_cancelled_order_shipments < 1:
         parser.error("--max-cancelled-order-shipments must be at least 1.")
+    if args.order_lookup_page_size < 1:
+        parser.error("--order-lookup-page-size must be at least 1.")
     args.oms_status = args.oms_status.strip()
     args.ecommerce_channel = args.ecommerce_channel.strip()
+    args.cancel_target_excluded_statuses = tuple(
+        status.upper()
+        for status in re.split(r"[,\s;]+", args.cancel_target_excluded_statuses.strip())
+        if status
+    )
     args.product_keys = tuple(
         key for key in re.split(r"[,\s;]+", args.product_keys.strip()) if key
     )
@@ -1253,6 +1629,22 @@ def main() -> int:
             log("  repeat-cancellation rule off: ecommerce is always auto reassigned.")
     else:
         log("No ecommerce channel set: every shipment is cancelled.")
+    if args.resolve_cancel_target:
+        log(
+            "Cancellations target the shipment of the order found with GET "
+            "/api/commerce/shipments?filter=externalOrderId==...: cancellable status"
+            + (
+                " (never CANCELED, another terminal status, REASSIGNED"
+                + (
+                    f" or {', '.join(args.cancel_target_excluded_statuses)})"
+                    if args.cancel_target_excluded_statuses else ")"
+                )
+            )
+            + f", same products (--product-match {args.product_match}), "
+            f"on several matches: {args.on_multiple_cancel_targets}."
+        )
+    else:
+        log("Cancellations target the shipmentNumber the CANCELLED event names.")
     log(f"Kibo host: {args.host}")
 
     kibo_credentials = load_json_env("KIBO_API_CREDS")
@@ -1537,6 +1929,77 @@ def main() -> int:
 
         log(f"    channel={candidate.channel or 'unknown'} ({candidate.channel_source}) "
             f"-> {candidate.resolution} ({candidate.resolution_source})")
+
+        # The shipment the CANCELLED event names has already been auto reassigned by
+        # Kibo, so it is REASSIGNED and will refuse a cancellation; the replacement
+        # shipment of the same order is the one to cancel. It is found by asking Kibo
+        # for the shipments of the order and keeping the cancellable one that carries
+        # the same products as the event.
+        candidate.event_shipment_number = candidate.kibo_shipment_number
+        candidate.external_order_id = (
+            shipment_external_order_id(shipment)
+            or external_order_id_from_shipment_order_number(candidate.shipment_order_number)
+        )
+        if candidate.resolution == RESOLUTION_CANCEL and args.resolve_cancel_target:
+            if not candidate.external_order_id:
+                candidate.cancel_target_source = "event (no externalOrderId)"
+                warn(
+                    f"    no externalOrderId for {candidate.shipment_order_number}: "
+                    f"cancelling {candidate.kibo_shipment_number} as named by the event."
+                )
+            else:
+                siblings, lookup_error = kibo.get_shipments_by_external_order_id(
+                    candidate.tenant_id, candidate.site_id, candidate.external_order_id,
+                    args.max_retries, args.order_lookup_page_size,
+                )
+                if lookup_error:
+                    candidate.action = "order_lookup_failed"
+                    candidate.error = (
+                        f"Could not read the shipments of order "
+                        f"{candidate.external_order_id}: {lookup_error}"
+                    )
+                    warn(f"    {candidate.error}")
+                    continue
+
+                target = resolve_cancel_target(
+                    siblings,
+                    products_by_number.get(candidate.shipment_order_number, frozenset()),
+                    args.product_keys,
+                    args.product_match,
+                    args.cancel_target_excluded_statuses,
+                    args.on_multiple_cancel_targets,
+                )
+                candidate.order_shipments = target.considered
+                candidate.cancel_target_candidates = ", ".join(target.matches)
+
+                if target.ambiguous:
+                    candidate.action = "ambiguous_cancel_target"
+                    candidate.error = target.error
+                    warn(f"    {candidate.error}")
+                    continue
+
+                if target.shipment_number:
+                    candidate.cancel_target_source = target.source
+                    if target.shipment_number != candidate.kibo_shipment_number:
+                        log(
+                            f"    order {candidate.external_order_id}: cancelling "
+                            f"{target.shipment_number} ({target.status or 'unknown'}) "
+                            f"instead of {candidate.kibo_shipment_number} "
+                            f"({candidate.kibo_status_before or 'unknown'})"
+                        )
+                    candidate.kibo_shipment_number = target.shipment_number
+                    candidate.kibo_status_before = target.status
+                    candidate.kibo_status_after = target.status
+                    shipment = target.shipment or shipment
+                else:
+                    candidate.cancel_target_source = "event (no match on the order)"
+                    if target.error:
+                        warn(f"    {target.error}")
+                    log(
+                        f"    order {candidate.external_order_id}: no cancellable "
+                        f"shipment with the same products ({target.considered or 'none returned'}); "
+                        f"keeping {candidate.kibo_shipment_number}."
+                    )
 
         if is_terminal_status(candidate.kibo_status_before):
             candidate.action = "already_terminal"
