@@ -975,6 +975,8 @@ class Candidate:
     cancelled_order_shipments: str = ""
     cancelled_order_shipment_numbers: str = ""
     cancelled_order_generations: str = ""
+    latest_event_type: str = ""
+    latest_event_shipment_order_number: str = ""
     repeat_cancel: str = ""
     resolution: str = ""
     resolution_source: str = ""
@@ -1276,6 +1278,14 @@ class OrderEvents:
     has_picked: bool = False
     picked_payload: Optional[Dict[str, Any]] = None
     picked_shipment_order_number: str = ""
+    # The newest warehouse event of the order, whatever its type. When it is a PICKED
+    # that actually picked something, the warehouse has moved on and nothing is
+    # cancelled; see `warehouse_moved_on_of`. `ordered` says whether the rows really
+    # came back newest first, which only holds when the table has a timestamp column.
+    latest_event_type: str = ""
+    latest_event_son: str = ""
+    latest_event_payload: Optional[Dict[str, Any]] = None
+    ordered: bool = False
     logistic_numbers: List[str] = field(default_factory=list)
     cancelled_logistic_numbers: List[str] = field(default_factory=list)
     # {shipmentOrderNumber: products} for the generations carrying a CANCELLED event.
@@ -1349,6 +1359,13 @@ def fetch_order_events(
                 if not matches_order_pattern(number, pattern):
                     continue
                 events = found.setdefault(pattern, OrderEvents())
+                # Rows arrive newest first, so the first one seen for an order is its
+                # latest warehouse event.
+                events.ordered = bool(ts_col)
+                if not events.latest_event_type:
+                    events.latest_event_type = event_type
+                    events.latest_event_son = number
+                    events.latest_event_payload = payload
                 if event_type in CANCELLED_EVENT_TYPES:
                     events.has_cancelled = True
                     events.cancelled_products |= products
@@ -1365,6 +1382,40 @@ def fetch_order_events(
                 if logistic and logistic not in events.logistic_numbers:
                     events.logistic_numbers.append(logistic)
     return found
+
+
+def warehouse_moved_on_of(events: OrderEvents) -> Tuple[bool, str]:
+    """
+    Whether the warehouse has moved on from the cancellations and is picking again.
+
+    An order's generations are cancelled one after another while no location can fulfil
+    it, but a later generation can be picked successfully: GXO then holds a shipment it
+    is actively working, and the earlier CANCELLED events are history. Cancelling at
+    that point would kill a shipment that is on its way out of the door.
+
+        WF-EUA00019586  CANCELLED        12 Nov 10:33   qty 1
+        WF-EUB00019586  PICKED           16 Nov 17:40   qty 1   <- latest, picked
+
+    The rule is the order's LATEST warehouse event: a PICKED whose total quantity is not
+    zero means the goods were found and nothing should be touched. A PICKED of quantity
+    zero is the opposite — nothing was found — and is the normal prelude to a
+    cancellation, so it does not stop the workflow.
+
+    Returns (moved_on, why). It never fires when the rows could not be ordered by time,
+    since "latest" would then be meaningless.
+    """
+    if not events.ordered or events.latest_event_type != PICKED_EVENT_TYPE:
+        return False, ""
+    if events.latest_event_payload is None:
+        return False, ""
+    total, found = picked_quantity_of(events.latest_event_payload)
+    if not found or total == 0:
+        return False, ""
+    return True, (
+        f"The latest warehouse event of the order is a PICKED of quantity "
+        f"{format_quantity(total)} on {events.latest_event_son}: the warehouse is "
+        "working this shipment, so nothing was cancelled."
+    )
 
 
 def warehouse_order_from_shipment(shipment: Dict[str, Any]) -> WarehouseOrder:
@@ -2071,7 +2122,8 @@ CSV_FIELDS = [
     "oms_tenant_id", "oms_site_id", "tenant_source", "oms_shipment_status",
     "oms_shipment_number", "sixth_character", "oms_channel", "kibo_channel", "channel", "channel_source",
     "order_pattern", "cancelled_products", "cancelled_order_shipments",
-    "cancelled_order_shipment_numbers", "cancelled_order_generations", "repeat_cancel",
+    "cancelled_order_shipment_numbers", "cancelled_order_generations",
+    "latest_event_type", "latest_event_shipment_order_number", "repeat_cancel",
     "resolution", "resolution_source", "has_cancelled_event", "has_picked_event", "picked_quantity",
     "logistic_order_number", "kibo_shipment_number", "number_matches_oms",
     "external_order_id", "event_shipment_number", "latest_cancelled_shipment_number",
@@ -2105,6 +2157,7 @@ def write_job_summary(candidates: List[Candidate], dry_run: bool) -> None:
     already = [c for c in candidates if c.action in ("already_terminal", "already_reassigned")]
     excluded = [c for c in candidates if c.action == "sixth_character_excluded"]
     unknown_brand = [c for c in candidates if c.action == "unknown_brand"]
+    warehouse_picked = [c for c in candidates if c.action == "warehouse_picked"]
     retenanted = [c for c in candidates if c.oms_tenant_id and (
         c.oms_tenant_id != c.tenant_id or c.oms_site_id != c.site_id)]
     failed = [c for c in candidates if c.error]
@@ -2147,6 +2200,8 @@ def write_job_summary(candidates: List[Candidate], dry_run: bool) -> None:
         f"- Already in a terminal or reassigned status: **{len(already)}**",
         f"- Tenant/site taken from the brand config rather than {BI_TABLE}: "
         f"**{len(retenanted)}**",
+        f"- Left alone, the warehouse's latest event is a successful PICKED: "
+        f"**{len(warehouse_picked)}**",
         f"- Left alone, brand not in the Kibo config: **{len(unknown_brand)}**",
         f"- Left alone, 6th character not allowed: **{len(excluded)}**",
         f"- With an error: **{len(failed)}**",
@@ -2562,6 +2617,21 @@ def main() -> int:
         # which are usually absent: they are what the cancel target has to carry.
         products_by_number[candidate.shipment_order_number] = events.cancelled_products
         candidate.cancelled_order_generations = ", ".join(sorted(events.cancelled_sons))
+        candidate.latest_event_type = events.latest_event_type
+        candidate.latest_event_shipment_order_number = events.latest_event_son
+
+        # The warehouse has the last word. If its most recent event on this order is a
+        # PICKED that actually picked something, the goods were found and the shipment
+        # is being worked; the older cancellations are history. Checked before the
+        # CANCELLED test so no Kibo call and no CANCEL to GXO is ever made for it.
+        moved_on, why = warehouse_moved_on_of(events)
+        if moved_on:
+            candidate.action = "warehouse_picked"
+            candidate.success = True
+            candidate.error = why
+            log(f"{candidate.shipment_order_number}: {why}")
+            rows.append(candidate)
+            continue
 
         if not events.has_cancelled:
             candidate.action = "skipped"
