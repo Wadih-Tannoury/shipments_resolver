@@ -117,19 +117,17 @@ Pipeline
    GXO refusing the POST -> `warehouse_cancel_failed`, and Kibo is left untouched.
    --no-warehouse-cancel skips the whole step and cancels in Kibo only, as before.
 
-4d. Kibo is cancelled ONLY when the shipment named by the LATEST CANCELLED event is the
-   cancel target itself, that is, when the warehouse cancelled the very shipment that is
-   now READY in a GXO location.
+4d. Kibo is cancelled as soon as GXO has accepted the CANCEL, in the same run. The
+   shipment cancelled is the READY GXO target of step 4b, whichever generation the
+   latest CANCELLED event happened to name: the CANCEL just sent to the warehouse is
+   what makes that shipment dead, so there is nothing to wait for.
 
-   When the two differ, GXO cancelled a shipment Kibo has already reassigned away from
-   it, and the READY GXO shipment is a replacement the warehouse has not cancelled yet.
-   Cancelling it in Kibo would throw away a shipment the floor still considers live, so
-   only the CANCEL event goes out and the row is reported as `canceled_warehouse_only`.
-   GXO then answers with its own CANCELLED event for that shipment, and the next run —
-   where the latest cancellation does name the READY GXO shipment — cancels it in Kibo.
-   The CANCELLED events are read newest first, so the first logisticOrderNumber carried
-   by a CANCELLED payload is the latest cancellation. --no-require-event-target cancels
-   in Kibo regardless, as before.
+   --require-event-target restores the cautious variant: Kibo is then cancelled only
+   when the latest CANCELLED event names the cancel target itself, and otherwise the
+   row is reported as `canceled_warehouse_only`, leaving Kibo to a later run once GXO
+   has answered with its own CANCELLED event for that shipment. The CANCELLED events
+   are read newest first, so the first logisticOrderNumber carried by a CANCELLED
+   payload is the latest cancellation.
 
 5a. Channel is NOT ecommerce  ->  cancel the shipment:
 
@@ -2195,6 +2193,7 @@ def write_job_summary(candidates: List[Candidate], dry_run: bool) -> None:
     unknown_brand = [c for c in candidates if c.action == "unknown_brand"]
     warehouse_picked = [c for c in candidates if c.action == "warehouse_picked"]
     ecommerce_blocked = [c for c in candidates if c.repeat_cancel == "blocked"]
+    ecommerce_untouched = [c for c in candidates if c.action == "ecommerce_disabled"]
     retenanted = [c for c in candidates if c.oms_tenant_id and (
         c.oms_tenant_id != c.tenant_id or c.oms_site_id != c.site_id)]
     failed = [c for c in candidates if c.error]
@@ -2237,8 +2236,10 @@ def write_job_summary(candidates: List[Candidate], dry_run: bool) -> None:
         f"- Already in a terminal or reassigned status: **{len(already)}**",
         f"- Tenant/site taken from the brand config rather than {BI_TABLE}: "
         f"**{len(retenanted)}**",
+        f"- Ecommerce left untouched, neither cancelled nor reassigned: "
+        f"**{len(ecommerce_untouched)}**",
         f"- Ecommerce reassigned rather than cancelled, cancellation disabled: "
-        f"**{len(ecommerce_blocked)}**",
+        f"**{len(ecommerce_blocked) - len(ecommerce_untouched)}**",
         f"- Left alone, the warehouse's latest event is a successful PICKED: "
         f"**{len(warehouse_picked)}**",
         f"- Left alone, brand not in the Kibo config: **{len(unknown_brand)}**",
@@ -2345,14 +2346,15 @@ def parse_args() -> argparse.Namespace:
                              "using the tenant_id and site_id from oms_active_shipments. "
                              "Off by default: an unconfirmed tenant means a filtered Kibo "
                              "query can come back empty instead of failing.")
-    parser.add_argument("--no-require-event-target", dest="require_event_target",
-                        action="store_false",
-                        help="Cancel in Kibo even when the latest CANCELLED event names a "
-                             "different shipment than the READY GXO one. By default Kibo is "
-                             "only cancelled when the warehouse cancelled the very shipment "
-                             "it is holding; otherwise the CANCEL event is sent to GXO and "
-                             "Kibo is left to the next run, once GXO has confirmed.")
-    parser.set_defaults(require_event_target=True)
+    parser.add_argument("--require-event-target", dest="require_event_target",
+                        action="store_true",
+                        help="Cancel in Kibo only when the latest CANCELLED event names the "
+                             "READY GXO shipment itself, and otherwise send the CANCEL to "
+                             "GXO and leave Kibo for a later run, once GXO has confirmed "
+                             "with its own CANCELLED event. OFF BY DEFAULT: the READY GXO "
+                             "shipment is cancelled in Kibo as soon as GXO accepts the "
+                             "CANCEL, whichever generation the cancellation named.")
+    parser.set_defaults(require_event_target=False)
     parser.add_argument("--no-warehouse-cancel", dest="warehouse_cancel",
                         action="store_false",
                         help="Do not send the CANCEL event to GXO; cancel in Kibo only. "
@@ -2384,6 +2386,14 @@ def parse_args() -> argparse.Namespace:
                              "reassigned instead, however often the order has come back "
                              "cancelled. Non-ecommerce shipments are unaffected.")
     parser.set_defaults(cancel_ecommerce=False)
+    parser.add_argument("--reassign-ecommerce", dest="reassign_ecommerce",
+                        action="store_true",
+                        help="Allow an ecommerce shipment to be auto reassigned. OFF BY "
+                             "DEFAULT: together with --cancel-ecommerce being off, this "
+                             "leaves ecommerce shipments entirely untouched for now — "
+                             "neither cancelled nor reassigned, and nothing sent to the "
+                             "warehouse. Non-ecommerce shipments are unaffected.")
+    parser.set_defaults(reassign_ecommerce=False)
     parser.add_argument("--no-repeat-cancel", dest="repeat_cancel", action="store_false",
                         help="Turn the repeat-cancellation rule off: ecommerce shipments are always "
                              "auto reassigned, however often the order has been cancelled before.")
@@ -2466,12 +2476,20 @@ def main() -> int:
             f"Channel '{args.ecommerce_channel}': auto reassign instead of cancel "
             f"(blockAssignment={'true' if args.block_assignment else 'false'})"
         )
-        if not args.cancel_ecommerce:
+        if not args.cancel_ecommerce and not args.reassign_ecommerce:
+            log(
+                "  ECOMMERCE DISABLED ENTIRELY: an ecommerce shipment is neither "
+                "cancelled nor reassigned, and nothing is sent to the warehouse for "
+                "one; it is left exactly as it is. Pass --cancel-ecommerce and/or "
+                "--reassign-ecommerce to put each half back."
+            )
+        elif not args.cancel_ecommerce:
             log(
                 "  ECOMMERCE CANCELLATION DISABLED: an ecommerce shipment is never "
                 "cancelled, however often the order has come back cancelled, and no "
-                "CANCEL is sent to the warehouse for one. Pass --cancel-ecommerce to "
-                "re-enable the repeat-cancellation rule."
+                "CANCEL is sent to the warehouse for one; it is auto reassigned "
+                "instead. Pass --cancel-ecommerce to re-enable the "
+                "repeat-cancellation rule."
             )
         elif args.repeat_cancel:
             log(
@@ -2518,7 +2536,10 @@ def main() -> int:
             "CANCELLED event."
         )
     else:
-        log("Kibo is cancelled whichever shipment the latest CANCELLED event names.")
+        log(
+            "The READY GXO shipment is cancelled in Kibo as soon as GXO accepts the "
+            "CANCEL, whichever generation the latest CANCELLED event named."
+        )
     log(f"Kibo host: {args.host}")
 
     kibo_credentials = load_json_env("KIBO_API_CREDS")
@@ -2917,6 +2938,22 @@ def main() -> int:
 
         log(f"    channel={candidate.channel or 'unknown'} ({candidate.channel_source}) "
             f"-> {candidate.resolution} ({candidate.resolution_source})")
+
+        # The second half of the ecommerce kill switch: with cancelling disabled the
+        # only thing left for an ecommerce shipment is the auto reassign, and that is
+        # off too for now, so the shipment is left exactly as it is. Kibo is not
+        # touched, nothing goes to the warehouse, and routing is left to do whatever it
+        # does on its own. --reassign-ecommerce puts the reassign back.
+        if (is_ecommerce and candidate.resolution == RESOLUTION_REASSIGN
+                and not args.reassign_ecommerce):
+            candidate.action = "ecommerce_disabled"
+            candidate.success = True
+            candidate.error = (
+                f"Channel '{candidate.channel}': ecommerce shipments are neither "
+                "cancelled nor reassigned at the moment, so nothing was done."
+            )
+            log("    ecommerce reassignment disabled: left untouched.")
+            continue
 
         # The shipment the CANCELLED event names has already been auto reassigned by
         # Kibo, so it is REASSIGNED and will refuse a cancellation; the replacement
