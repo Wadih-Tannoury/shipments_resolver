@@ -704,6 +704,23 @@ def shipment_items_of(shipment: Dict[str, Any]) -> List[Any]:
     return []
 
 
+def reassigned_or_cancelled_items_of(shipment: Dict[str, Any]) -> List[Any]:
+    """
+    The items that have left the shipment: reassigned, cancelled, rejected, transferred.
+
+    Only used to read the channel, never for the product match: these lines are no
+    longer part of what the shipment would ship, so counting them as products would make
+    a shipment match an event it no longer covers.
+    """
+    items: List[Any] = []
+    for key in ("reassignedItems", "canceledItems", "cancelledItems",
+                "rejectedItems", "transferredItems"):
+        value = shipment.get(key)
+        if isinstance(value, list):
+            items.extend(value)
+    return items
+
+
 def item_products(item: Any, product_keys: Sequence[str]) -> frozenset[str]:
     """Every product identifier carried by one shipment item, nesting included."""
     if not isinstance(item, (dict, list)):
@@ -1851,15 +1868,27 @@ def shipment_channel(shipment: Dict[str, Any]) -> str:
     """
     The shipment's channel as Kibo reports it.
 
-    Kibo does not put the channel at the top level of the shipment. It appears in the
-    shipment's own `data` map ("channel": "Order Connector", alongside "channelType":
-    "marketplace") and again on every item's `data` map ("channel": "ecommerce" or
-    "Farfetch"). Reading only the top level reports every shipment as unknown, which
-    sends an ecommerce shipment down the cancel path instead of the reassign one.
+    The channel is read from the ITEMS, in each item's `data` map:
 
-    The shipment's own data wins over the items', so the answer does not depend on the
-    order the keys happen to appear in; the deep search is the last resort.
+        items[].data.channel   "ecommerce", "Farfetch", ...
+
+    That is the sales channel the order came through, and it is what decides between
+    cancelling and auto reassigning. The shipment's own `data.channel` is NOT it: it
+    names how the order reached Kibo ("Order Connector", with "channelType":
+    "marketplace") and would read as a channel of its own, so the items win over it.
+
+    Items that are no longer on the shipment are consulted too, because a shipment whose
+    lines have all been reassigned or cancelled keeps them under reassignedItems or
+    canceledItems and would otherwise report no channel at all. The shipment-level data
+    and a deep search remain as last resorts, for a shipment with no items left anywhere.
     """
+    for item in shipment_items_of(shipment) + reassigned_or_cancelled_items_of(shipment):
+        data = item.get("data") if isinstance(item, dict) else None
+        if isinstance(data, dict):
+            for key in ("channel", "channelName", "salesChannel"):
+                value = clean(data.get(key))
+                if value:
+                    return value
     for key in ("channel", "channelName", "salesChannel"):
         value = clean(shipment.get(key))
         if value:
