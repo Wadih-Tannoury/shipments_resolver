@@ -1583,9 +1583,19 @@ class KiboClient:
     def get_shipment(
         self, tenant_id: str, site_id: str, shipment_number: str, max_retries: int
     ) -> Tuple[Optional[Dict[str, Any]], str]:
+        """
+        One shipment by its number.
+
+        NO x-vol-site header is sent, for the same reason as the order lookup: the site
+        scopes the request, and a shipment that lives on another site of the same tenant
+        comes back as HTTP 404 "Could not find shipment N" — indistinguishable from a
+        number that does not exist. The shipmentNumber is unique within the tenant, so
+        the tenant alone is enough to read it, and the shipment then reports its own
+        siteId, which is what the later write calls use.
+        """
         response, error = self.request(
             "GET", self.base_url(tenant_id, site_id, shipment_number),
-            tenant_id, site_id, max_retries=max_retries,
+            tenant_id, "", max_retries=max_retries,
         )
         if response is None:
             return None, error
@@ -1822,20 +1832,44 @@ def shipments_in_response(payload: Any) -> List[Dict[str, Any]]:
     return []
 
 
+def shipment_site_id(shipment: Dict[str, Any]) -> str:
+    """
+    The siteId Kibo reports on the shipment.
+
+    This is the authority for the site, over both oms_active_shipments and the brand
+    config: a shipment of tenant 29993 can sit on site 53604 while the brand table says
+    53602, and every call that carries the wrong site either 404s or comes back empty.
+    """
+    for key in ("siteId", "site_id"):
+        value = clean(shipment.get(key))
+        if value:
+            return value
+    return ""
+
+
 def shipment_channel(shipment: Dict[str, Any]) -> str:
     """
     The shipment's channel as Kibo reports it.
 
-    Kibo does not put the channel on the shipment: it sits on each item, inside its
-    `data` map ("data": {"channel": "ecommerce", ...}). Looking only at the top level
-    reports every shipment as channel unknown, which sends an ecommerce shipment down
-    the cancel path instead of the reassign one, so the nesting is searched too. The
-    first non-empty value wins; items of one shipment share a channel in practice.
+    Kibo does not put the channel at the top level of the shipment. It appears in the
+    shipment's own `data` map ("channel": "Order Connector", alongside "channelType":
+    "marketplace") and again on every item's `data` map ("channel": "ecommerce" or
+    "Farfetch"). Reading only the top level reports every shipment as unknown, which
+    sends an ecommerce shipment down the cancel path instead of the reassign one.
+
+    The shipment's own data wins over the items', so the answer does not depend on the
+    order the keys happen to appear in; the deep search is the last resort.
     """
     for key in ("channel", "channelName", "salesChannel"):
         value = clean(shipment.get(key))
         if value:
             return value
+    data = shipment.get("data")
+    if isinstance(data, dict):
+        for key in ("channel", "channelName", "salesChannel"):
+            value = clean(data.get(key))
+            if value:
+                return value
     for key in ("channel", "channelName", "salesChannel"):
         for value in iter_values(shipment, key):
             text = clean(value)
@@ -2310,17 +2344,25 @@ def main() -> int:
         candidate.brand = brand_of(candidate.shipment_order_number)
         config_site, config_tenant = kibo_config_for_brand(candidate.brand)
         if config_tenant:
-            if (config_tenant != candidate.tenant_id
-                    or config_site != candidate.site_id):
+            # Only the TENANT is taken from the config. The configured site has been
+            # seen to disagree with the shipment's real one (CA is configured 53602 but
+            # its shipments sit on 53604), and a wrong site 404s the shipment read, so
+            # the site is left as oms_active_shipments has it and then replaced by what
+            # Kibo reports once the shipment has been read.
+            if config_tenant != candidate.tenant_id:
                 warn(
                     f"{candidate.shipment_order_number}: {BI_TABLE} says tenant "
-                    f"{candidate.tenant_id}/site {candidate.site_id}, brand "
-                    f"{candidate.brand} is configured as tenant {config_tenant}/site "
-                    f"{config_site}. Using the configured pair."
+                    f"{candidate.tenant_id}, brand {candidate.brand} is configured as "
+                    f"tenant {config_tenant}. Using {config_tenant}."
                 )
             candidate.tenant_id = config_tenant
-            candidate.site_id = config_site
             candidate.tenant_source = f"brand {candidate.brand}"
+            if config_site and config_site != candidate.site_id:
+                warn(
+                    f"{candidate.shipment_order_number}: configured site {config_site} "
+                    f"differs from {BI_TABLE}'s {candidate.site_id}; the site Kibo "
+                    "reports on the shipment is used for any write."
+                )
         else:
             candidate.tenant_source = BI_TABLE
             if not args.allow_unknown_brand:
@@ -2539,6 +2581,18 @@ def main() -> int:
         candidate.kibo_status_before = shipment_status(shipment)
         candidate.kibo_status_after = candidate.kibo_status_before
         candidate.kibo_channel = shipment_channel(shipment)
+
+        # Kibo has now told us which site the shipment really sits on. It is the
+        # authority over both oms_active_shipments and the brand config, which have both
+        # been seen to be off by a site, and the cancel and reassign PUTs use it.
+        kibo_site = shipment_site_id(shipment)
+        if kibo_site and kibo_site != candidate.site_id:
+            log(
+                f"    site {candidate.site_id} ({candidate.tenant_source}) -> "
+                f"{kibo_site} as reported by the shipment"
+            )
+            candidate.site_id = kibo_site
+            candidate.tenant_source = f"{candidate.tenant_source}, site from kibo"
 
         # oms_active_shipments wins when it carries a channel; otherwise the Kibo
         # shipment itself is the source. Both are kept in the CSV.
