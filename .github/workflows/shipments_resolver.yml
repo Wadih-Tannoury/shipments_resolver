@@ -4,8 +4,13 @@ name: Shipments resolver
 #
 #   release-held-exchange : release_held_exchange_shipments.py  (runs daily, see schedule)
 #   fulfill-gxo           : fulfill_gxo_shipments.py            (manual only)
-#   cancel-cancelled      : cancel_cancelled_shipments.py       (manual only)
 #   reassign-blocked      : reassign_blocked_shipments.py       (manual only)
+#   cancel-cancelled      : cancel_cancelled_shipments.py       SWITCHED OFF
+#
+# cancel-cancelled is off: it is not in the `scripts` dropdown, `all` does not include
+# it, and its job never runs. The job below is kept, ready to go, so turning it back on
+# is two edits: put `- cancel-cancelled` back in the dropdown options and restore the
+# job's `if:` condition to the one commented out above it.
 #
 # The schedule runs only release-held-exchange. To put another script on the schedule,
 # add it to the `if:` condition of its job below.
@@ -19,7 +24,6 @@ on:
         options:
           - release-held-exchange
           - fulfill-gxo
-          - cancel-cancelled
           - reassign-blocked
           - all
         default: all
@@ -71,66 +75,30 @@ on:
         description: "cancel-cancelled: shipmentStatus to keep in oms_active_shipments (empty = no filter)"
         type: string
         default: "READY"
-      no_picked_reason:
-        description: "cancel-cancelled: what to do when a CANCELLED shipment has no PICKED event"
-        type: choice
-        options:
-          - skip
-          - no-inventory
-          - customer
-        default: skip
-      ecommerce_channel:
-        description: "cancel-cancelled: shipments on this channel are auto reassigned instead of cancelled (empty = cancel everything)"
-        type: string
-        default: "ecommerce"
-      block_assignment:
-        description: "cancel-cancelled: on auto reassign, block the location that cancelled the shipment"
-        type: boolean
-        default: false
       allowed_sixth_characters:
         description: "cancel-cancelled: optional filter, only act when the generation letter (6th character) is one of these (empty = every generation, the default)"
         type: string
         default: ""
+      cancel_target_statuses:
+        description: "cancel-cancelled: shipmentStatus a shipment of the order must have to be cancelled"
+        type: string
+        default: "BACKORDER,CUSTOMER_CARE"
+      mark_cancelled_on_kibo:
+        description: "cancel-cancelled: set cancelled_on_kibo = true in orders_cancellation_table after a successful cancellation"
+        type: boolean
+        default: true
       cancel_extra_args:
-        description: "cancel-cancelled: extra flags passed straight to the script, e.g. --cancel-target-status READY --cancel-target-location-pattern '%GX%' --on-no-cancel-target event"
+        description: "cancel-cancelled: extra flags passed straight to the script, e.g. --on-multiple-cancel-targets newest --no-require-latest-cancelled"
         type: string
         default: ""
-      warehouse_cancel:
-        description: "cancel-cancelled: send the CANCEL event to GXO before cancelling in Kibo"
-        type: boolean
-        default: true
-      ecommerce_mode:
-        description: "cancel-cancelled: what to do with ecommerce shipments"
-        type: choice
-        options:
-          - "none (leave untouched)"
-          - "reassign only"
-          - "reassign + cancel on repeats"
-        default: "none (leave untouched)"
-      require_event_target:
-        description: "cancel-cancelled: wait for GXO's own CANCELLED event before cancelling in Kibo (off = cancel in Kibo as soon as GXO accepts)"
-        type: boolean
-        default: false
-      repeat_cancel:
-        description: "cancel-cancelled: cancel an ecommerce shipment instead of reassigning it when the same products of the order keep coming back cancelled"
-        type: boolean
-        default: true
-      max_cancelled_order_shipments:
-        description: "cancel-cancelled: cancelled shipmentOrderNumbers of one order tolerated before cancelling instead of reassigning"
-        type: string
-        default: "3"
       product_match:
-        description: "cancel-cancelled: how 'the same products' is decided when counting the cancelled shipmentOrderNumbers of an order"
+        description: "cancel-cancelled: how 'the same items' is decided between the CANCELLED event, the Kibo shipment and shipment_items"
         type: choice
         options:
           - exact
           - overlap
           - any
         default: exact
-      resolve_cancel_target:
-        description: "cancel-cancelled: cancel the shipment of the order found by externalOrderId instead of the REASSIGNED one the event names"
-        type: boolean
-        default: true
       location_column:
         description: "reassign-blocked: monitoring table column holding the fulfillment location CODE (empty = auto-detect)"
         type: string
@@ -264,10 +232,16 @@ jobs:
 
   cancel-cancelled:
     name: Cancel cancelled shipments in Kibo${{ inputs.dry_run && ' (dry run)' || '' }}
-    # Manual runs only. Add `github.event_name == 'schedule' ||` to put it on the schedule.
-    if: >-
-      inputs.scripts == 'cancel-cancelled'
-      || inputs.scripts == 'all'
+    # SWITCHED OFF. This job never runs, not on the schedule and not on a manual run,
+    # whatever `scripts` is set to — `cancel-cancelled` is not even in the dropdown.
+    # To turn it back on, put `- cancel-cancelled` back in the options of the `scripts`
+    # input and restore the condition below:
+    #
+    #   if: >-
+    #     inputs.scripts == 'cancel-cancelled'
+    #     || inputs.scripts == 'all'
+    #
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -290,20 +264,12 @@ jobs:
           BI_BIGQUERY_CREDS: ${{ secrets.BI_BIGQUERY_CREDS }}
           TIL_BIGQUERY_CREDS: ${{ secrets.TIL_BIGQUERY_CREDS }}
           KIBO_API_CREDS: ${{ secrets.KIBO_API_CREDS }}
-          GXO_API_CREDS: ${{ secrets.GXO_API_CREDS }}
           INPUT_OMS_STATUS: ${{ inputs.cancel_oms_status }}
-          INPUT_NO_PICKED_REASON: ${{ inputs.no_picked_reason || 'skip' }}
-          INPUT_ECOMMERCE_CHANNEL: ${{ inputs.ecommerce_channel }}
-          INPUT_BLOCK_ASSIGNMENT: ${{ inputs.block_assignment }}
+          INPUT_CANCEL_TARGET_STATUSES: ${{ inputs.cancel_target_statuses || 'BACKORDER,CUSTOMER_CARE' }}
+          INPUT_MARK_CANCELLED: ${{ inputs.mark_cancelled_on_kibo }}
           INPUT_ALLOWED_SIXTH: ${{ inputs.allowed_sixth_characters }}
-          INPUT_REPEAT_CANCEL: ${{ inputs.repeat_cancel }}
-          INPUT_MAX_CANCELLED_ORDER_SHIPMENTS: ${{ inputs.max_cancelled_order_shipments || '3' }}
           INPUT_PRODUCT_MATCH: ${{ inputs.product_match || 'exact' }}
-          INPUT_RESOLVE_CANCEL_TARGET: ${{ inputs.resolve_cancel_target }}
           INPUT_CANCEL_EXTRA_ARGS: ${{ inputs.cancel_extra_args }}
-          INPUT_WAREHOUSE_CANCEL: ${{ inputs.warehouse_cancel }}
-          INPUT_ECOMMERCE_MODE: ${{ inputs.ecommerce_mode }}
-          INPUT_REQUIRE_EVENT_TARGET: ${{ inputs.require_event_target }}
           INPUT_HOST: ${{ inputs.kibo_host || 'tp3.mozu.com' }}
           INPUT_LIMIT: ${{ inputs.limit || '0' }}
           INPUT_NUMBERS: ${{ inputs.numbers }}
@@ -311,37 +277,13 @@ jobs:
         run: |
           DRY_RUN_FLAG=""
           if [ "$INPUT_DRY_RUN" = "true" ]; then DRY_RUN_FLAG="--dry-run"; fi
-          BLOCK_FLAG=""
-          if [ "$INPUT_BLOCK_ASSIGNMENT" = "true" ]; then BLOCK_FLAG="--block-assignment"; fi
-          REPEAT_FLAG=""
-          if [ "$INPUT_REPEAT_CANCEL" = "false" ]; then REPEAT_FLAG="--no-repeat-cancel"; fi
-          TARGET_FLAG=""
-          if [ "$INPUT_RESOLVE_CANCEL_TARGET" = "false" ]; then TARGET_FLAG="--no-resolve-cancel-target"; fi
-          WAREHOUSE_FLAG=""
-          if [ "$INPUT_WAREHOUSE_CANCEL" = "false" ]; then WAREHOUSE_FLAG="--no-warehouse-cancel"; fi
-          ECOM_FLAG=""
-          REASSIGN_ECOM_FLAG=""
-          case "$INPUT_ECOMMERCE_MODE" in
-            "reassign only") REASSIGN_ECOM_FLAG="--reassign-ecommerce" ;;
-            "reassign + cancel on repeats")
-              REASSIGN_ECOM_FLAG="--reassign-ecommerce"
-              ECOM_FLAG="--cancel-ecommerce" ;;
-          esac
-          EVENT_TARGET_FLAG=""
-          if [ "$INPUT_REQUIRE_EVENT_TARGET" = "true" ]; then EVENT_TARGET_FLAG="--require-event-target"; fi
+          MARK_FLAG=""
+          if [ "$INPUT_MARK_CANCELLED" = "false" ]; then MARK_FLAG="--no-mark-cancelled"; fi
           python cancel_cancelled_shipments.py \
             $DRY_RUN_FLAG \
-            $BLOCK_FLAG \
-            $REPEAT_FLAG \
-            $TARGET_FLAG \
-            $WAREHOUSE_FLAG \
-            $EVENT_TARGET_FLAG \
-            $ECOM_FLAG \
-            $REASSIGN_ECOM_FLAG \
+            $MARK_FLAG \
             --oms-status "$INPUT_OMS_STATUS" \
-            --no-picked-reason "$INPUT_NO_PICKED_REASON" \
-            --ecommerce-channel "$INPUT_ECOMMERCE_CHANNEL" \
-            --max-cancelled-order-shipments "$INPUT_MAX_CANCELLED_ORDER_SHIPMENTS" \
+            --cancel-target-statuses "$INPUT_CANCEL_TARGET_STATUSES" \
             --product-match "$INPUT_PRODUCT_MATCH" \
             --allowed-sixth-characters "$INPUT_ALLOWED_SIXTH" \
             --host "$INPUT_HOST" \
