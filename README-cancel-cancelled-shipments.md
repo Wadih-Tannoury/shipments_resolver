@@ -1,32 +1,32 @@
 # Cancel cancelled shipments in Kibo
 
-Manually triggered GitHub Actions workflow that resolves in Kibo the shipments the
-warehouse has already cancelled, with the reason code derived from the PICKED quantity.
-Shipments on the **ecommerce** channel are auto reassigned instead of cancelled, so they
-go back through order routing and land in backorder; everything else is cancelled. An
-ecommerce shipment whose order — every `shipmentOrderNumber` matching
-`LIKE 'DJ-US%ST0000124550'` — has already had the same products cancelled under more
-than three of them is cancelled too, because routing has run out of places to try.
-Because Kibo auto reassigns a shipment the moment the warehouse cancels it, a
-cancellation is applied to the replacement shipment of the same order, not to the
-`REASSIGNED` `shipmentNumber` the event names.
+> **This flow is switched off.** `cancel-cancelled` is no longer in the **Which
+> script(s) to run** dropdown, `all` does not include it, and its job in
+> `.github/workflows/shipments_resolver.yml` is pinned to `if: false`. The script
+> itself is complete and ready; the other three flows (`release-held-exchange`,
+> `fulfill-gxo`, `reassign-blocked`) are unaffected. See
+> [Turning it back on](#turning-it-back-on).
+
+Resolves in Kibo the shipments the warehouse has already cancelled. The cancellation
+list is **`tlg-business-intelligence-prd`.til.orders_cancellation_table**: nothing is
+cancelled unless that table carries a row for the shipment with
+`cancelled_on_kibo = false`, and the `reasonCode` and `moreInfo` sent to Kibo are the
+row's own.
 
 ## Repository layout
 
 ```
 README-cancel-cancelled-shipments.md
 README-fulfill-gxo-shipments.md
+README-reassign-blocked-shipments.md
 README-release-held-exchange-shipments.md
 cancel_cancelled_shipments.py
 fulfill_gxo_shipments.py
+reassign_blocked_shipments.py
 release_held_exchange_shipments.py
 requirements.txt
 .github/workflows/shipments_resolver.yml
 ```
-
-`shipments_resolver.yml` triggers every script in the repository; this one is its
-`cancel-cancelled` job. Pick it in the **Which script(s) to run** dropdown, or pick
-`all` to run every script.
 
 ## Repository secrets
 
@@ -36,312 +36,171 @@ requirements.txt
 | `TIL_BIGQUERY_CREDS` | Service account JSON for `tlg-wlfs-prd` |
 | `KIBO_API_CREDS` | `{"client_id": "...", "client_secret": "..."}` |
 
-Same secrets as the `fulfill-gxo` job: nothing new to create. Both service accounts
-only need read access (Job User on their project, Data Viewer on the `til` dataset).
+`GXO_API_CREDS` is no longer used: nothing is sent to the warehouse any more.
+`BI_BIGQUERY_CREDS` now needs **write** access as well (BigQuery Data Editor on the
+`til` dataset), because the run flags the rows it cancelled; read access is enough with
+`--no-mark-cancelled`.
 
-## Which shipments are in scope
+## The flow
 
-The 6th character of the `shipmentOrderNumber` gates everything. Counting every
-character, the hyphen included, it has to be one of **A, B, C or D**; anything else is
-left alone — neither cancelled nor reassigned — and reported as
-`sixth_character_excluded`. Excluded shipments cost no Kibo call and no event query.
+### 1. Narrow the list
 
-| shipmentOrderNumber | 6th character | In scope |
-| --- | --- | --- |
-| `DJ-USA00041696` | `A` | yes |
-| `DJ-USD00041696` | `D` | yes |
-| `DJ-USE00041696` | `E` | no |
-| `DJ-USF00041696` | `F` | no |
-| `DJ-USI00041696` | `I` | no |
+```sql
+SELECT shipment_order_number, shipment_number, tenant_id, site_id
+FROM `tlg-business-intelligence-prd`.til.oms_active_shipments
+WHERE shipmentStatus = 'READY'
+```
 
-A number shorter than 6 characters is treated as out of scope and reported, rather than
-guessed at. Change the set with the `allowed_sixth_characters` input (`ABCD`, `A,B,C,D`
-and `abcd` all work); set it empty to turn the rule off.
+The status filter is the `cancel_oms_status` input (`--oms-status`); empty disables it.
 
-## What the run does
-
-1. Reads `shipment_order_number`, the shipment number, `tenant_id` and `site_id` from
-   `tlg-business-intelligence-prd.til.oms_active_shipments`, keeping only the rows
-   whose `shipmentStatus` is `READY`, same as the `fulfill-gxo` job. Anything already
-   cancelled, fulfilled or otherwise not pending never reaches Kibo.
-2. For those shipment order numbers, reads the `CANCELLED` and `PICKED` events from
-   `tlg-wlfs-prd.til.prd_shipmentStatus` — the same join as the `fulfill-gxo` job.
-   A shipment with no `CANCELLED` event is skipped. Both `CANCELLED` and `CANCELED`
-   spellings are matched.
-3. Reads the total quantity from the `requestPayload` of the `PICKED` event — the sum
-   of every `quantity` value found anywhere in the payload, so nested item lists are
-   handled. When several `PICKED` events exist, the most recent one is used.
-4. Picks the reason:
-
-   | PICKED quantity | `reasonCode` and `moreInfo` |
-   | --- | --- |
-   | not zero | `Customer Changed Their Mind` |
-   | zero | `No Inventory` |
-
-5. Reads the shipment from Kibo:
-
-   `GET https://t{tenantId}.tp3.mozu.com/api/commerce/shipments/{shipmentNumber}`
-
-   The `GET` is a safety net: a shipment Kibo already reports as CANCELED, CLOSED,
-   SHIPPED or otherwise terminal is reported as `already_terminal` and left alone, so
-   re-running the job is harmless. It also supplies the shipment's `channel`, which
-   decides step 6.
-
-6. **Channel is not ecommerce — cancel:**
-
-   `PUT https://t{tenantId}.tp3.mozu.com/api/commerce/shipments/{shipmentNumber}/canceled`
-
-   ```json
-   {"canceledReason": {"reasonCode": "No Inventory", "moreInfo": "No Inventory"}}
-   ```
-
-   The reason has to be nested under `canceledReason`, per the `CancelShipment`
-   schema. Kibo answers `200 OK` to a flat `{"reasonCode": ..., "moreInfo": ...}`
-   body but ignores it and records its own default reason (`Canceled`), so the run
-   looks successful while the Reason column in the admin UI is wrong.
-
-   **Channel is ecommerce — auto reassign instead:**
-
-   `PUT https://t{tenantId}.tp3.mozu.com/api/commerce/shipments/{shipmentNumber}/reassigned`
-
-   ```json
-   {"blockAssignment": false,
-    "isUserAction": true,
-    "reassignedReason": {"reasonCode": "No Inventory", "moreInfo": "No Inventory"}}
-   ```
-
-   A shipment Kibo already reports as REASSIGNED or BACKORDER is reported as
-   `already_reassigned` and left alone.
-
-   **Channel is ecommerce but the order keeps coming back cancelled — cancel anyway:**
-   see the next section.
-
-   After a successful call the shipment is read back and the stored
-   `shipmentStatusReason.reasonCode` is written to the `kibo_reason_after` column; if
-   it differs from the reason that was sent, the run logs a warning. Every call carries
-   `x-vol-tenant` and `x-vol-site`.
-
-## When an ecommerce shipment is cancelled instead of reassigned
-
-Reassigning only helps while some other location might still fulfil the order. Once the
-same products have come back `CANCELLED` under **more than 3** distinct
-`shipmentOrderNumber` values of the same order number, routing has tried everywhere it
-can, and another reassign would only bounce the shipment around again. At that point the
-active `READY` shipment is cancelled instead, with the same reason code step 4 picked.
-
-**The order.** `prd_shipmentStatus` has no order number column, so the shipments of one
-order are found the way you would find them by hand: the `shipmentOrderNumber` with its
-6th character — the generation letter the scope rule already keys on — replaced by the
-SQL wildcard.
+### 2. The order's last warehouse event must be a cancellation
 
 ```sql
 SELECT * FROM `tlg-wlfs-prd`.til.prd_shipmentStatus
 WHERE shipmentOrderNumber LIKE 'DJ-US%ST0000124550'
 ```
 
-| shipmentOrderNumber | LIKE pattern |
-| --- | --- |
-| `DJ-USAST0000124550` | `DJ-US%ST0000124550` |
-| `DJ-USBST0000124550` | `DJ-US%ST0000124550` |
-| `DJ-USCST0000124550` | `DJ-US%ST0000124550` |
-| `DJ-USDST0000124550` | `DJ-US%ST0000124550` |
+`prd_shipmentStatus` has no order number, so the order is the `shipmentOrderNumber`
+with its 6th character — the generation letter — wildcarded. The events are read per
+**order**, not per `shipmentOrderNumber`, because the active shipment usually carries
+none of its own: the warehouse cancels generation F, Kibo reassigns into a fresh G, and
+G is what sits `READY` while every event still names A to F.
 
-The pattern is in the CSV as `order_pattern`. A `shipmentOrderNumber` shorter than 6
-characters, or one already containing a `%` or `_`, gets no pattern: it is reported and
-reassigned as before rather than matched against something wider than intended.
+Every event type is read, and the **most recent** one has to be a `CANCELLED`
+(`CANCELED` is accepted too). A later `PICKED`, `SHIPPED` or anything else means the
+warehouse moved on, and the row is reported as `latest_event_not_cancelled` and left
+alone. `--no-require-latest-cancelled` relaxes this to "a cancellation exists
+somewhere in the history".
 
-**The count.** `prd_shipmentStatus` is read a second time on those patterns, not on the
-shipment order numbers of `oms_active_shipments`, so the earlier generations that have
-long since left the active table are counted too — they are exactly the ones that
-matter. One query carries 50 patterns (`--pattern-batch-size`), since `LIKE` cannot use
-an index and every pattern widens the scan; `repeat_cancel = false` skips the query
-altogether. The shipment being processed counts itself, since it carries a `CANCELLED`
-event of its own, so `A`, `B`, `C` and `D` all cancelled with the same products gives 4,
-which is more than 3, and `D` is cancelled rather than reassigned. Generations outside
-the `ABCD` scope rule still count towards the total — they are cancellations of the same
-order — they just never become the shipment being acted on.
+The items of that last `CANCELLED` event are what the rest of the run matches on.
 
-**The products.** They are the product codes found anywhere in the `CANCELLED`
-`requestPayload` — `upc`, `sku`, `productCode`, `variationProductCode`, `itemCode`,
-`partNumber`, `productId`, `barcode`, `ean`, `styleCode` — compared case-insensitively.
+### 3. Find the shipment to cancel
 
-| `product_match` | counts a shipmentOrderNumber when |
-| --- | --- |
-| `exact` (default) | its product set is identical |
-| `overlap` | it shares at least one product |
-| `any` | always, products are ignored |
+```
+GET https://t{tenantId}.{host}/api/commerce/shipments?filter=externalOrderId=={id}
+```
 
-A shipment whose `CANCELLED` payload names no products at all is reported with
-`repeat_cancel = unknown` and auto reassigned as before, rather than cancelled on a
-guess; so is one with no usable pattern. Set `max_cancelled_order_shipments` to change the
-threshold, or `repeat_cancel` to `false` to turn the rule off and always reassign.
+The `externalOrderId` is the shipment's own field, falling back to the
+`shipmentOrderNumber` with its 6th character put back to a hyphen
+(`DJ-USAST0000124550` → `DJ-US-ST0000124550`).
 
-## Why that body is an auto reassign
+Out of the shipments of that order, the target is the one that
 
-Kibo's `ReassignShipment` schema is
-`{blockAssignment, fulfillmentLocationCode, holdBlockAssignment, isUserAction, items, reassignedReason, runId}`
-([Reassign Shipments](https://docs.kibocommerce.com/api-reference/shipment/reassign-shipments)).
-There is no separate auto-reassign endpoint or flag: the Order Admin offers **Manual**
-and **Auto Reassign** against this same call, and the difference is whether a target
-location is named. Manual sets `fulfillmentLocationCode`; auto leaves it out, and
-[the docs](https://docs.kibocommerce.com/pages/edit-order-shipments) describe that case
-as sending the shipment back through the order routing process. Routing then picks a new
-location, or drops the shipment into backorder when no location can fulfil it.
+| Condition | Default | Input |
+| --- | --- | --- |
+| `shipmentStatus` is one of | `BACKORDER`, `CUSTOMER_CARE` | `cancel_target_statuses` |
+| is in a cancellable status | not `CANCELED`/terminal, not `REASSIGNED` | `--cancel-target-excluded-statuses` |
+| carries the exact same items as the `CANCELLED` event | exact | `product_match` |
+| has a row in `orders_cancellation_table` with `cancelled_on_kibo = false` | required | — |
+| whose `shipment_items` are those same items | exact | `product_match` |
 
-`blockAssignment` is `false`, so routing stays free to pick the location that just
-cancelled the shipment. Set the `block_assignment` input to `true` (or pass
-`--block-assignment`) to exclude that location instead, which prevents a shipment
-bouncing back to the warehouse that could not fulfil it.
+The table is looked up on **both** the shipment's `shipmentOrderNumber` and its Kibo
+`shipmentNumber`, so the `shipment_order_number` column may hold either. Which one
+matched is reported in the CSV as `table_matched_on`.
 
-## Where the channel comes from
+Several matches → `ambiguous_cancel_target`, nothing is touched
+(`--on-multiple-cancel-targets newest` takes the most recent one instead). No match →
+`no_cancel_target`, and the CSV's `error` says how far down the chain the order got:
+wrong status, items that do not line up, or no open row in the table.
 
-The channel is read from `oms_active_shipments` when the table has a `channel` column
-(`channel_name`, `sales_channel` and `order_channel` are also accepted). If it has none,
-the script warns once and falls back to the `channel` field of the Kibo shipment read in
-step 5. Both values and the one actually used are in the CSV as `oms_channel`,
-`kibo_channel`, `channel` and `channel_source`.
+### 4. Cancel in Kibo
 
-The comparison ignores case, spaces, hyphens and underscores, so `ecommerce`,
-`E-Commerce` and `E_COMMERCE` all match. Change the value with the `ecommerce_channel`
-input; set it to empty to cancel every shipment regardless of channel, which is the
-behaviour this job had before.
+```
+PUT https://t{tenantId}.{host}/api/commerce/shipments/{shipmentNumber}/canceled
 
-## How a row is matched to a Kibo shipment
+{"canceledReason": {"reasonCode": "<reason_code>", "moreInfo": "<more_info>"}}
+```
 
-Both keys of the `oms_active_shipments` row have to line up:
+`reasonCode` comes from the table's `reason_code` column and `moreInfo` from its
+`more_info` column; `--default-reason-code` / `--default-more-info` fill in when a
+value is empty or the column does not exist. The reason has to be nested under
+`canceledReason`: Kibo answers 200 to a flat body but ignores it and records its own
+default. The shipment is read back afterwards and the stored
+`shipmentStatusReason.reasonCode` is reported, so a silently ignored reason shows up.
 
-| `oms_active_shipments` | matched against |
-| --- | --- |
-| `shipment_order_number` | the `shipmentOrderNumber` of the CANCELLED / PICKED event |
-| shipment number | the Kibo `shipmentNumber` derived from `data.logisticOrderNumber` |
+### 5. Flag the rows
 
-The derivation is the `fulfill-gxo` rule: take `data.logisticOrderNumber` from the
-CANCELLED or PICKED `requestPayload` (`BB82902`), drop the first two characters, and
-the rest is the Kibo `shipmentNumber` (`82902`).
+```sql
+UPDATE `tlg-business-intelligence-prd`.til.orders_cancellation_table
+SET cancelled_on_kibo = TRUE
+WHERE shipment_order_number IN UNNEST(@numbers)
+```
 
-A shipment order number can carry several `logisticOrderNumber` values; only the one
-whose `shipmentNumber` equals the shipment number of that `oms_active_shipments` row is
-cancelled. When none of them matches, nothing is sent to Kibo and the row is reported
-with `number_matches_oms = no` and the numbers the payload actually gave, so a mismatch
-is visible in the CSV instead of becoming a cancellation on the wrong shipment.
+One statement at the end of the run, so a later run skips them. Turn it off with the
+`mark_cancelled_on_kibo` input (`--no-mark-cancelled`); a dry run never writes. The
+literal matches the column's type, so `BOOL`, `STRING` and `INT64` all work, and the
+same tolerance applies when reading the flag (`true`, `TRUE`, `1`, `yes`; `NULL` reads
+as false).
 
-If `oms_active_shipments` turns out to have no shipment number column, the script warns
-once, skips the check, and marks those rows `unchecked`.
+Should a run die between the cancellation and this update, the cancellations stand and
+nothing is cancelled twice: the next run finds those shipments `CANCELED` in Kibo
+rather than `BACKORDER`, so they are no longer targets.
 
-## Which shipment actually gets cancelled
+## What is no longer done
 
-That `shipmentNumber` identifies the shipment the warehouse was working on — and by the
-time this job runs, Kibo has already auto reassigned it. The shipment is `REASSIGNED`,
-which Kibo will not cancel, and the work has moved to a **new** `shipmentNumber` that
-can be cancelled. So whenever the outcome is a cancellation, the target is resolved
-against the order rather than taken from the event:
+- **Nothing is sent to GXO.** The warehouse has already cancelled — that is what put
+  the shipment in the table — and the target is a backordered or customer-care
+  shipment it never held. The `CANCEL` event, `prd_orders`, `prd_brandConfig` and the
+  legacy-TLS adapter are gone.
+- **Nothing is reassigned.** The ecommerce branch (auto reassign instead of cancel) and
+  the repeat-cancellation rule that counted cancelled generations are gone. The table
+  decides what gets cancelled, whatever the channel.
+- **The reason is no longer derived from the `PICKED` quantity.** It comes from the
+  table.
 
-`GET https://t{tenantId}.tp3.mozu.com/api/commerce/shipments?filter=externalOrderId=={externalOrderId}`
-
-The Shipment API has its own filter syntax (`field==value`, clauses joined by `;`),
-unlike the `field eq value` of the other Kibo APIs — see
-[Querying Order Shipments](https://docs.kibocommerce.com/pages/fulfillment-api-overview).
-Only the `externalOrderId` clause is sent; the statuses are filtered in the script, so
-every sibling shipment and its status lands in the CSV as `order_shipments`.
-
-**The externalOrderId** comes from the shipment read in step 5. If that field is empty,
-it is derived from the `shipmentOrderNumber` by putting the 6th character — the
-generation letter — back to a hyphen, the inverse of what the `release-held-exchange`
-job does:
-
-| shipmentOrderNumber | externalOrderId |
-| --- | --- |
-| `DJ-USAST0000124550` | `DJ-US-ST0000124550` |
-
-**The target** is the shipment of that order which is both
-
-- in a cancellable status: not already `CANCELED`, nor any other terminal status
-  (`CLOSED`, `SHIPPED`, …), nor `REASSIGNED`, which Kibo refuses as well. `READY`,
-  `BACKORDER` and everything else are valid targets; `cancel_target_excluded_statuses`
-  (empty by default) can exclude more.
-- carrying the exact same products as the `CANCELLED` event: every product of the event
-  is on the shipment, **and** every item of the shipment is in the event. A Kibo item
-  names the same product several ways at once (`productCode`, `variationProductCode`,
-  `upc`) while the payload names it once, so the comparison is per item rather than one
-  flat set. `product_match` `overlap` only asks for one product in common, `any` skips
-  the check.
-
-| outcome | what happens |
-| --- | --- |
-| exactly one match | that `shipmentNumber` is cancelled; the CSV keeps the original in `event_shipment_number` |
-| no match | the shipment the event names is cancelled, as before, with `cancel_target_source = event (no match on the order)` |
-| several matches | nothing is touched, row reported as `ambiguous_cancel_target`; `on_multiple_cancel_targets = newest` cancels the most recently created one instead |
-
-The lookup runs only for cancellations. Reassignments still act on the shipment the
-event names, where a shipment already `REASSIGNED` or `BACKORDER` is reported as
-`already_reassigned` and left alone. Set `resolve_cancel_target` to `false` to go back
-to cancelling the `shipmentNumber` the event names.
-
-## Workflow inputs
+## Inputs
 
 | Input | Default | Meaning |
 | --- | --- | --- |
-| `scripts` | `release-held-exchange` | Pick `cancel-cancelled` to run this job |
-| `dry_run` | `false` | Read everything, call neither the `canceled` nor the `reassigned` endpoint |
-| `numbers` | empty | Restrict the run to these `shipmentOrderNumber`s |
-| `limit` | `0` | Maximum rows read from `oms_active_shipments` (0 = no limit) |
+| `dry_run` | false | Run every check and read, write nothing |
+| `cancel_oms_status` | `READY` | `shipmentStatus` kept in `oms_active_shipments` |
+| `cancel_target_statuses` | `BACKORDER,CUSTOMER_CARE` | Statuses a shipment of the order must have to be cancelled |
+| `mark_cancelled_on_kibo` | true | Set `cancelled_on_kibo = true` after a successful cancellation |
+| `product_match` | `exact` | `exact`, `overlap` or `any` |
+| `allowed_sixth_characters` | *(empty)* | Optional generation-letter filter; empty means every generation |
+| `numbers` | *(empty)* | Restrict the run to these `shipmentOrderNumber`s |
+| `limit` | 0 | Maximum rows to process |
 | `kibo_host` | `tp3.mozu.com` | Kibo host suffix |
-| `cancel_oms_status` | `READY` | Keep only this `shipmentStatus` in `oms_active_shipments` (empty = no filter) |
-| `no_picked_reason` | `skip` | What to do with a CANCELLED shipment that has no PICKED event: `skip`, or resolve it as `no-inventory` or `customer` |
-| `ecommerce_channel` | `ecommerce` | Shipments on this channel are auto reassigned instead of cancelled (empty = cancel everything) |
-| `block_assignment` | `false` | On auto reassign, block the location that cancelled the shipment |
-| `allowed_sixth_characters` | `ABCD` | Only act when the 6th character of the `shipmentOrderNumber` is one of these (empty = no rule) |
-| `repeat_cancel` | `true` | Cancel an ecommerce shipment instead of reassigning it when the same products of the order have been cancelled too often |
-| `max_cancelled_order_shipments` | `3` | How many cancelled `shipmentOrderNumber`s of one order are tolerated before cancelling instead of reassigning |
-| `product_match` | `exact` | How "the same products" is decided: `exact`, `overlap` or `any` |
-| `resolve_cancel_target` | `true` | Cancel the shipment of the order found by `externalOrderId` instead of the one the event names |
-
-`cancel_target_excluded_statuses` (empty by default) and `on_multiple_cancel_targets`
-(default `skip`, or `newest`) are command-line flags only — `workflow_dispatch` is
-already well past GitHub's documented limit of 10 inputs, so they were left out of the
-run form.
-
-A shipment whose PICKED payload carries no `quantity` field at all is skipped and
-reported, rather than treated as zero.
+| `cancel_extra_args` | *(empty)* | Flags passed straight through, e.g. `--on-multiple-cancel-targets newest` |
 
 ## Results
 
-The job uploads `cancel_cancelled_shipments_results.csv` as an artifact (30 days) and
-writes a summary table to the run page. One row per Kibo shipment, with
-`oms_shipment_number`, `sixth_character`, `oms_channel`, `kibo_channel`, `channel`, `channel_source`,
-`order_pattern`, `cancelled_products`, `cancelled_order_shipments`,
-`cancelled_order_shipment_numbers`, `repeat_cancel` (`yes`, `no` or `unknown`),
-`resolution` (`cancel` or `reassign`), `resolution_source`, `has_cancelled_event`, `has_picked_event`,
-`picked_quantity`, `reason_code`, `logistic_order_number`, `kibo_shipment_number`,
-`number_matches_oms`, `external_order_id`, `event_shipment_number`, `order_shipments`,
-`cancel_target_candidates`, `cancel_target_source`, the Kibo status before and after,
-`kibo_reason_after`, the action (`canceled`, `reassigned`, `would_cancel`,
-`would_reassign`, `already_terminal`, `already_reassigned`, `ambiguous_cancel_target`,
-`sixth_character_excluded`, `skipped`, `read_failed`, `order_lookup_failed`,
-`cancel_failed`, `reassign_failed`), and the error when there is one.
+The job uploads `cancel_cancelled_shipments_results.csv` and writes a summary table to
+the run page. One row per active shipment; `action` is one of:
 
-`kibo_shipment_number` is the shipment that was acted on; when the order lookup moved
-the cancellation to the replacement shipment, the original is in
-`event_shipment_number` and the summary table shows it as `82999 (was 82902)`.
+| action | Meaning |
+| --- | --- |
+| `canceled` | Cancelled in Kibo |
+| `would_cancel` | Dry run: everything matched, nothing was called |
+| `cancel_failed` | Kibo refused the cancellation |
+| `latest_event_not_cancelled` | A later warehouse event superseded the cancellation |
+| `no_cancelled_event` | No `CANCELLED` event for any generation of the order |
+| `no_cancelled_items` | The `CANCELLED` payload carries no product identifier |
+| `no_cancel_target` | No listed `BACKORDER`/`CUSTOMER_CARE` shipment with those items |
+| `ambiguous_cancel_target` | Several shipments of the order qualify |
+| `already_terminal` | Kibo already had it cancelled or closed |
+| `order_lookup_failed` | `getShipments` by `externalOrderId` failed |
+| `no_external_order_id` | No `externalOrderId` could be read or derived |
+| `unknown_brand` | Brand not in `BRAND_KIBO_CONFIG` |
+| `sixth_character_excluded` | Outside `allowed_sixth_characters` |
 
-For an ecommerce shipment, `kibo_status_after` is where routing put it: `BACKORDER` when
-no location could take it, otherwise the new state.
+`table_updated` says whether the `orders_cancellation_table` row was flagged
+(`yes`, `no`, `failed`, `no (dry run)`).
 
-Exit code `0` when nothing failed, `2` when at least one eligible shipment failed.
+## Turning it back on
 
-## Running it locally
+Two edits in `.github/workflows/shipments_resolver.yml`:
 
-```bash
-pip install -r requirements.txt
-export BI_BIGQUERY_CREDS="$(cat bi-service-account.json)"
-export TIL_BIGQUERY_CREDS="$(cat til-service-account.json)"
-export KIBO_API_CREDS='{"client_id":"...","client_secret":"..."}'
+1. Put `- cancel-cancelled` back in the options of the `scripts` input.
+2. Restore the `cancel-cancelled` job's condition, which is commented out just above
+   its current `if: false`:
 
-python cancel_cancelled_shipments.py --dry-run --limit 20
-```
+   ```yaml
+   if: >-
+     inputs.scripts == 'cancel-cancelled'
+     || inputs.scripts == 'all'
+   ```
 
-Start with `--dry-run` on a handful of known shipment order numbers:
-
-```bash
-python cancel_cancelled_shipments.py --dry-run --shipment-order-numbers "SO123,SO456"
-```
+Then run it with **Dry run** ticked first: the CSV shows exactly which shipment each
+order would be cancelled on, with the table row and reason behind it, without calling
+the `canceled` endpoint or writing to BigQuery.
