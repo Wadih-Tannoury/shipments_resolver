@@ -23,7 +23,20 @@ Pipeline
    | true                  | false / null   | release the exchange hold, then reassign  |
    | any                   | true           | skipped, reported as `hold_process_true`  |
 
-3. Release the exchange hold, exactly as release_held_exchange_shipments.py does:
+3. Ask Kibo what the shipment is now, and reassign only what still can be:
+
+       GET https://t{tenantId}.{host}/api/commerce/shipments?filter=externalOrderId=={orderNumber}
+
+   The Shipment API is queried by order, not by shipmentNumber, so the shipment
+   is picked out of what comes back on its own shipmentNumber. A shipment whose
+   shipmentStatus is REASSIGNED, CANCELED or FULFILLED is past reassigning:
+   Kibo answers the PUT with HTTP 409 "Shipment action [reassign] isn't
+   applicable to shipment <n>", which spends a write call and reads as an error
+   when in fact there was simply nothing left to do. Those are reported as
+   `skipped_not_reassignable`, with the status in the CSV. --skip-status-check
+   restores the old behaviour of calling /reassigned regardless.
+
+4. Release the exchange hold, exactly as release_held_exchange_shipments.py does:
 
        PUT https://t{tenantId}.{host}/api/commerce/shipments/{shipmentNumber}/data?merge=true
        x-vol-tenant: {tenantId}
@@ -31,7 +44,7 @@ Pipeline
 
        {"holdExchangeProcess": false}
 
-4. Reassign the shipment to the location it is already assigned to:
+5. Reassign the shipment to the location it is already assigned to:
 
        PUT https://t{tenantId}-s{siteId}.{host}/api/commerce/shipments/{shipmentNumber}/reassigned
        x-vol-tenant: {tenantId}
@@ -94,18 +107,24 @@ BQ_SCOPES = ["https://www.googleapis.com/auth/bigquery"]
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 # Candidate column names, resolved case-insensitively against the real schema.
+# prd_fulfillment_monitoring_table calls the Kibo shipment number `oms_shipment_number`,
+# the same name oms_active_shipments uses; the rest are fallbacks for other tables.
 SHIPMENT_NUMBER_CANDIDATES = (
-    "shipment_number", "shipmentNumber", "kibo_shipment_number", "kiboShipmentNumber",
-    "shipment_id", "shipmentId",
+    "oms_shipment_number", "omsShipmentNumber", "shipment_number", "shipmentNumber",
+    "kibo_shipment_number", "kiboShipmentNumber", "shipment_id", "shipmentId",
 )
 TENANT_CANDIDATES = ("tenant_id", "tenantId")
 SITE_CANDIDATES = ("site_id", "siteId")
-# The reassign call needs the location CODE. location_name is the last resort, because on
-# some tenants the two are the same value.
+# The reassign call needs the location CODE. prd_fulfillment_monitoring_table has no
+# code column, only location_name, so that is what the run falls back to; on these
+# tenants the name and the code are usually the same string. Override with
+# --location-column if that turns out not to hold.
 LOCATION_CODE_CANDIDATES = (
     "location_code", "locationCode", "fulfillment_location_code", "fulfillmentLocationCode",
     "location", "location_name", "locationName",
 )
+# Resolving to one of these means the run is sending a name where Kibo wants a code.
+LOCATION_NAME_FALLBACKS = {"location_name", "locationname"}
 FULFILLMENT_STATUS_CANDIDATES = ("fulfillment_status", "fulfillmentStatus")
 SHIPMENT_ORDER_NUMBER_CANDIDATES = ("shipment_order_number", "shipmentOrderNumber")
 LOCATION_NAME_CANDIDATES = ("location_name", "locationName")
@@ -145,6 +164,23 @@ def clean(value: Any) -> str:
         return str(int(value))
     text = str(value).strip()
     return text[:-2] if re.fullmatch(r"\d+\.0", text) else text
+
+
+def shipments_in_payload(payload: Any) -> List[Dict[str, Any]]:
+    """
+    The shipments in a getShipments response, whatever shape it arrives in.
+
+    A filtered query answers with {"items": [...]}; a single shipment can come
+    back bare. Anything else yields nothing rather than a guess.
+    """
+    if isinstance(payload, dict):
+        items = payload.get("items")
+        if isinstance(items, list):
+            return [item for item in items if isinstance(item, dict)]
+        return [payload] if payload.get("shipmentNumber") is not None else []
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    return []
 
 
 def is_true(value: Any) -> bool:
@@ -237,6 +273,12 @@ def resolve_column(
 # Data model
 # ---------------------------------------------------------------------------
 
+# The statuses a shipment cannot be reassigned out of. Checked before the PUT:
+# Kibo answers a reassign on one of these with HTTP 409 and the shipment is
+# left exactly as it was, so the call buys nothing and costs a write.
+NOT_REASSIGNABLE_STATUSES = ("REASSIGNED", "CANCELED", "FULFILLED")
+
+
 @dataclass
 class Shipment:
     """One row of the monitoring table."""
@@ -250,6 +292,7 @@ class Shipment:
     order_submit_date: str = ""
     hold_exchange_process: str = ""
     hold_process: str = ""
+    shipment_status: str = ""
     needs_release: bool = False
     released: bool = False
     release_error: str = ""
@@ -301,6 +344,12 @@ def fetch_blocked_shipments(
     else:
         location_col = resolve_column(columns, LOCATION_CODE_CANDIDATES, where)
     log(f"Location code read from column `{location_col}`.")
+    if not location_column and location_col.lower() in LOCATION_NAME_FALLBACKS:
+        warn(
+            f"{BI_TABLE} has no location code column, so `{location_col}` is being sent as "
+            "fulfillmentLocationCode. If Kibo rejects the location, pass --location-column "
+            "with the column that holds the real code."
+        )
 
     filters = [
         f"`{status_col}` = @fulfillment_status",
@@ -515,6 +564,44 @@ class KiboClient:
             f"/api/commerce/shipments/{quote(shipment_number, safe='')}/data?merge=true"
         )
 
+    def shipments_url(self, tenant_id: str, external_order_id: str) -> str:
+        filter_value = quote(f"externalOrderId=={clean(external_order_id)}", safe="=")
+        return (
+            f"https://t{clean(tenant_id)}.{self.host}"
+            f"/api/commerce/shipments?filter={filter_value}&pageSize=200"
+        )
+
+    def shipment_status(
+        self, shipment: "Shipment", max_retries: int, correlation_id: str
+    ) -> Tuple[str, str]:
+        """
+        The shipment's current shipmentStatus, read before anything is written.
+
+        Returns (status, error). No site header, the same as the cancellation
+        worker's getShipments call. An empty status with no error means the
+        order was read and this shipment was not among its shipments.
+        """
+        if not shipment.order_number:
+            return "", "no order number to query getShipments with"
+        url = self.shipments_url(shipment.tenant_id, shipment.order_number)
+        response, error = self.request(
+            "GET", url, shipment.tenant_id, "",
+            max_retries=max_retries, correlation_id=correlation_id,
+        )
+        if response is None:
+            return "", error
+        if not (200 <= response.status_code < 300):
+            return "", f"HTTP {response.status_code}: {excerpt_of(response, 300)}"
+        try:
+            payload = response.json()
+        except ValueError:
+            return "", "The getShipments response was not JSON."
+        wanted = clean(shipment.shipment_number)
+        for item in shipments_in_payload(payload):
+            if clean(item.get("shipmentNumber")) == wanted:
+                return clean(item.get("shipmentStatus")).upper(), ""
+        return "", ""
+
     def reassign_url(self, tenant_id: str, site_id: str, shipment_number: str) -> str:
         return (
             f"https://t{tenant_id}-s{site_id}.{self.host}"
@@ -560,6 +647,7 @@ class KiboClient:
 CSV_FIELDS = [
     "shipment_number", "order_number", "tenant_id", "site_id", "location_code", "location_name",
     "blocking_reason", "order_submit_date", "hold_exchange_process", "hold_process",
+    "shipment_status",
     "needs_release", "released", "release_error",
     "action", "success", "status_code", "error", "response_excerpt", "correlation_id",
 ]
@@ -631,6 +719,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--location-column", default="",
                         help=f"Monitoring table column holding the fulfillment location CODE. "
                              f"Default: the first of {list(LOCATION_CODE_CANDIDATES)} that exists.")
+    parser.add_argument("--skip-status-check", action="store_true",
+                        help="Do not call getShipments first; PUT /reassigned whatever the status.")
+    parser.add_argument("--not-reassignable-statuses", default=",".join(NOT_REASSIGNABLE_STATUSES),
+                        help="Comma separated shipmentStatus values to skip rather than reassign. "
+                             f"Default: {','.join(NOT_REASSIGNABLE_STATUSES)}.")
     parser.add_argument("--timeout", type=float, default=60.0, help="HTTP timeout in seconds.")
     parser.add_argument("--max-retries", type=int, default=3, help="Maximum attempts per Kibo request.")
     parser.add_argument("--sleep-between-requests", type=float, default=0.2,
@@ -646,6 +739,8 @@ def parse_args() -> argparse.Namespace:
     args.host = re.sub(r"^https?://", "", args.host.strip(), flags=re.IGNORECASE)
     args.host = args.host.split("/", 1)[0]
     args.host = re.sub(r"^t\d+(?:-s\d+)?\.", "", args.host, flags=re.IGNORECASE).rstrip(".")
+    args.not_reassignable = tuple(value.strip().upper()
+                                  for value in split_values(args.not_reassignable_statuses))
     return args
 
 
@@ -706,6 +801,28 @@ def main() -> int:
             f"(tenant={shipment.tenant_id}, site={shipment.site_id})"
             + (" [hold_exchange_process=true]" if shipment.needs_release else "")
         )
+
+        # Step 3: what Kibo says the shipment is now. A read, so it runs on a
+        # dry run too — a dry run that reports a reassign Kibo would refuse is
+        # worse than no dry run at all.
+        if not args.skip_status_check:
+            status, status_error = kibo.shipment_status(
+                shipment, args.max_retries, shipment.correlation_id
+            )
+            shipment.shipment_status = status
+            if status_error:
+                shipment.action = "status_check_failed"
+                shipment.error = f"GET /shipments failed: {status_error}"
+                warn(f"    {shipment.error}")
+                warn("    not reassigned: the status could not be confirmed")
+                continue
+            if status in args.not_reassignable:
+                shipment.action = "skipped_not_reassignable"
+                shipment.success = True
+                shipment.response_excerpt = f"shipmentStatus={status}"
+                log(f"    shipmentStatus={status}, nothing left to reassign")
+                continue
+            log(f"    shipmentStatus={status or '(not found on the order)'}")
 
         if args.dry_run:
             if shipment.needs_release:
@@ -772,7 +889,9 @@ def main() -> int:
     log(
         f"Summary: {rows_read} rows read, {len(eligible)} shipments, "
         f"{sum(1 for s in eligible if s.released)} exchange holds released, "
-        f"{sum(1 for s in eligible if s.success)} reassigned, "
+        f"{sum(1 for s in eligible if s.action == 'reassigned')} reassigned, "
+        f"{sum(1 for s in eligible if s.action == 'skipped_not_reassignable')} "
+        f"already in a final status, "
         f"{len(failures)} with an error, {len(held)} left alone, "
         f"{len(incomplete)} incomplete rows."
     )
